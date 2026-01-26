@@ -1,12 +1,27 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+/// Parser for WASM binary format (Core 1.0).
+///
+/// This parser allocates memory for parsed structures and does not provide
+/// individual deinit functions. It is designed to work with an ArenaAllocator
+/// for simple cleanup of all parsed data at once.
+///
+/// Example usage:
+///     var arena = std.heap.ArenaAllocator.init(gpa);
+///     defer arena.deinit();
+///
+///     var parser = Parser.init(arena.allocator(), wasm_bytes);
+///     const module = try parser.parseModule();
+///     // All allocations are freed when arena.deinit() is called
 const Parser = struct {
     const Self = @This();
     bytes: []const u8,
     index: usize = 0,
     allocator: std.mem.Allocator,
 
+    /// Initialize a new Parser.
+    /// The allocator should typically be an ArenaAllocator for simple cleanup.
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Self {
         return Self{
             .bytes = bytes,
@@ -220,16 +235,17 @@ const Parser = struct {
         const opcode = try self.readByte();
 
         return switch (opcode) {
-            0x00 => .unreachable_op,
+            0x00 => .@"unreachable",
             0x01 => .nop,
             0x02, 0x03 => |op| {
                 const block_type = try self.readBlockType();
                 const res = try self.readInstructionSequence(&.{0x0B});
+                const instructions = try res.instructions.toOwnedSlice();
 
                 if (op == 0x02) {
-                    return .{ .block = .{ .block_type = block_type, .instructions = res.instructions } };
+                    return .{ .block = .{ .block_type = block_type, .instructions = instructions } };
                 } else {
-                    return .{ .loop = .{ .block_type = block_type, .instructions = res.instructions } };
+                    return .{ .loop = .{ .block_type = block_type, .instructions = instructions } };
                 }
             },
             0x04 => {
@@ -237,19 +253,18 @@ const Parser = struct {
 
                 // Read the "then" block, which can end with 0x0B (end) or 0x05 (else)
                 const then_res = try self.readInstructionSequence(&.{ 0x0B, 0x05 });
-                var else_instructions: std.ArrayList(types.Instr) = undefined;
+                const then_instructions = try then_res.instructions.toOwnedSlice();
+                var else_instructions: []types.Instr = &.{};
 
                 if (then_res.terminator == 0x05) {
                     const else_res = try self.readInstructionSequence(&.{0x0B});
-                    else_instructions = else_res.instructions;
-                } else {
-                    else_instructions = std.ArrayList(types.Instr).init(self.allocator);
+                    else_instructions = try else_res.instructions.toOwnedSlice();
                 }
 
                 return .{
-                    .if_else = .{
+                    .@"if" = .{
                         .block_type = block_type,
-                        .then_instructions = then_res.instructions,
+                        .then_instructions = then_instructions,
                         .else_instructions = else_instructions,
                     },
                 };
@@ -265,7 +280,7 @@ const Parser = struct {
             0x0E => {
                 const labels = try self.readVector(types.LabelIndex, Self.readU32);
                 const default_idx = try self.readU32();
-                return .{ .label_indices = labels, .default_idx = default_idx };
+                return .{ .br_table = .{ .label_indices = labels, .default_idx = default_idx } };
             },
             0x0F => .return_op,
             0x10 => {
@@ -464,41 +479,56 @@ const Parser = struct {
 };
 
 test "readByte" {
-    var parser = Parser.init(std.testing.allocator, &[_]u8{ 1, 2, 3 });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator(), &[_]u8{ 1, 2, 3 });
     try std.testing.expectEqual(@as(u8, 1), try parser.readByte());
     try std.testing.expectEqual(@as(u8, 2), try parser.readByte());
     try std.testing.expectEqual(@as(u8, 3), try parser.readByte());
 }
 
 test "readU32" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     var buffer: [2]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buffer);
     try std.leb.writeUleb128(fbs.writer(), @as(u32, 1998));
-    var parser = Parser.init(std.testing.allocator, buffer[0..]);
+    var parser = Parser.init(arena.allocator(), buffer[0..]);
     try std.testing.expectEqual(@as(u32, 1998), try parser.readU32());
 }
 
 test "readF32" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     var buffer: [4]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buffer);
     var writer = fbs.writer();
     const val: f32 = 3.14;
     try writer.writeInt(u32, @bitCast(val), .little);
-    var parser = Parser.init(std.testing.allocator, buffer[0..]);
+    var parser = Parser.init(arena.allocator(), buffer[0..]);
     try std.testing.expectEqual(val, try parser.readF32());
 }
 
 test "readF64" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     var buffer: [8]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buffer);
     var writer = fbs.writer();
     const val: f64 = 3.14;
     try writer.writeInt(u64, @bitCast(val), .little);
-    var parser = Parser.init(std.testing.allocator, buffer[0..]);
+    var parser = Parser.init(arena.allocator(), buffer[0..]);
     try std.testing.expectEqual(val, try parser.readF64());
 }
 
 test "readVector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     var buffer: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buffer);
     const writer = fbs.writer();
@@ -507,22 +537,20 @@ test "readVector" {
     try std.leb.writeUleb128(writer, @as(u16, 2));
     try std.leb.writeUleb128(writer, @as(u16, 3));
 
-    var parser = Parser.init(std.testing.allocator, buffer[0..]);
+    var parser = Parser.init(arena.allocator(), buffer[0..]);
     const vec = try parser.readVector(u16, Parser.readU16);
-    defer parser.allocator.free(vec);
     try std.testing.expectEqual(@as(u16, 1), vec[0]);
     try std.testing.expectEqual(@as(u16, 2), vec[1]);
     try std.testing.expectEqual(@as(u16, 3), vec[2]);
 }
 
 test "readFunc" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
     const buffer = [_]u8{ 0x60, 0x2, 0x7F, 0x7E, 0x1, 0x7D }; // (i32, i64) -> (f32)
-    var parser = Parser.init(std.testing.allocator, buffer[0..]);
+    var parser = Parser.init(arena.allocator(), buffer[0..]);
     const func_type = try parser.readFuncType();
-    defer {
-        parser.allocator.free(func_type.params);
-        parser.allocator.free(func_type.results);
-    }
 
     try std.testing.expectEqual(@as(usize, 2), func_type.params.len);
     try std.testing.expectEqual(types.ValType.i32, func_type.params[0]);

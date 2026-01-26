@@ -68,20 +68,20 @@ pub const MemoryInstrArg = struct { alignment: u32, offset: u32 };
 
 pub const Block = struct {
     block_type: BlockType,
-    instructions: std.ArrayList(Instr),
-
-    pub fn deinit(self: *Block, allocator: std.mem.Allocator) void {
-        self.instructions.deinit(allocator);
-    }
+    instructions: []Instr,
 };
 
 pub const Instr = union(enum) {
     // Control instructions
-    unreachable_op,
+    @"unreachable",
     nop,
     block: Block,
     loop: Block,
-    if_op: struct { block_type: BlockType, then_instructions: std.ArrayList(Instr), else_instructions: std.ArrayList(Instr) },
+    @"if": struct {
+        block_type: BlockType,
+        then_instructions: []Instr,
+        else_instructions: []Instr,
+    },
     br: LabelIndex,
     br_if: LabelIndex,
     br_table: struct { label_indices: []LabelIndex, default_idx: LabelIndex },
@@ -255,33 +255,9 @@ pub const Instr = union(enum) {
     i64_reinterpret_f64,
     f32_reinterpret_i32,
     f64_reinterpret_i64,
-
-    pub fn deinit(self: Instr, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .block => |b| b.deinit(allocator),
-            .loop => |b| b.deinit(allocator),
-            .if_op => |if_op| {
-                if_op.then_instructions.deinit(allocator);
-                if_op.else_instructions.deinit(allocator);
-            },
-            .br_table => |br_table| {
-                allocator.free(br_table.label_indices);
-            },
-            else => {},
-        }
-    }
 };
 
 pub const Expr = []Instr;
-
-pub const CustomSection = struct {
-    name: Name,
-    data: []const Byte,
-};
-
-pub const TypeSection = struct {
-    types: []FuncType,
-};
 
 pub const Import = struct {
     module: Name,
@@ -330,6 +306,12 @@ pub const Data = struct {
     init: []const Byte,
 };
 
+pub const CustomSection = struct {
+    name: Name,
+    data: []const Byte,
+};
+
+pub const TypeSection = []FuncType;
 pub const ImportSection = []Import;
 pub const FunctionSection = []TypeIndex;
 pub const TableSection = []TableType;
