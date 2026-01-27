@@ -69,6 +69,15 @@ const Parser = struct {
         return self.readUInt(u32);
     }
 
+    fn readFixedU32(self: *Self) !u32 {
+        if (self.index + 4 > self.bytes.len) {
+            return error.EndOfInput;
+        }
+        const val = std.mem.readInt(u32, self.bytes[self.index..][0..4], .little);
+        self.index += 4;
+        return val;
+    }
+
     fn readU64(self: *Self) !u64 {
         return self.readUInt(u64);
     }
@@ -114,9 +123,14 @@ const Parser = struct {
     }
 
     fn readName(self: *Self) !types.Name {
-        const len = try self.readU32();
-        const bytes = self.bytes[self.index..][0..len];
-        self.index += len;
+        const name_len = try self.readU32();
+
+        if (self.index + name_len > self.bytes.len) {
+            return error.EndOfInput;
+        }
+
+        const bytes = self.bytes[self.index .. self.index + name_len];
+        self.index += name_len;
         return bytes;
     }
 
@@ -133,12 +147,12 @@ const Parser = struct {
     }
 
     fn readBlockType(self: *Self) !types.BlockType {
-        const n = try self.readByte();
+        const n = try self.peekByte();
 
         if (n == 0x40) {
+            self.index += 1; // consume the byte
             return .empty;
         } else {
-            self.index -= 1; // unread the byte
             const val_type = try self.readValType();
             return .{ .val_type = val_type };
         }
@@ -200,28 +214,119 @@ const Parser = struct {
         return .{ .val_type = val_type, .mutable = mutable };
     }
 
+    fn readGlobal(self: *Self) !types.Global {
+        const type_ = try self.readGlobalType();
+        const init_expr = try self.readExpr();
+        return .{ .type = type_, .init = init_expr };
+    }
+
+    fn readImport(self: *Self) !types.Import {
+        const module_name = try self.readName();
+        const field_name = try self.readName();
+        const desc_type = try self.readByte();
+        const import_desc: types.ImportDesc = switch (desc_type) {
+            0x00 => .{ .func = try self.readU32() },
+            0x01 => .{ .table = try self.readTableType() },
+            0x02 => .{ .mem = try self.readMemType() },
+            0x03 => .{ .global = try self.readGlobalType() },
+            else => return error.InvalidImportDesc,
+        };
+
+        return .{
+            .module = module_name,
+            .name = field_name,
+            .desc = import_desc,
+        };
+    }
+
+    fn readExport(self: *Self) !types.Export {
+        const name = try self.readName();
+        const desc_type = try self.readByte();
+        const export_desc: types.ExportDesc = switch (desc_type) {
+            0x00 => .{ .func = try self.readU32() },
+            0x01 => .{ .table = try self.readU32() },
+            0x02 => .{ .mem = try self.readU32() },
+            0x03 => .{ .global = try self.readU32() },
+            else => return error.InvalidExportDesc,
+        };
+
+        return .{
+            .name = name,
+            .desc = export_desc,
+        };
+    }
+
+    fn readElem(self: *Self) !types.Elem {
+        const table_idx = try self.readU32();
+        const offset_expr = try self.readExpr();
+        const func_indices = try self.readVector(types.FuncIndex, Self.readU32);
+
+        return .{
+            .table = table_idx,
+            .offset = offset_expr,
+            .init = func_indices,
+        };
+    }
+
+    fn readLocals(self: *Self) !types.Locals {
+        const count = try self.readU32();
+        const val_type = try self.readValType();
+        return .{ .count = count, .type = val_type };
+    }
+
+    fn readCode(self: *Self) !types.Code {
+        const body_size = try self.readU32();
+        const body_end = self.index + @as(usize, body_size);
+        const locals = try self.readVector(types.Locals, Self.readLocals);
+        const expr = try self.readExpr();
+
+        if (self.index != body_end) {
+            return error.InvalidCodeBodySize;
+        }
+
+        return .{
+            .locals = locals,
+            .body = expr,
+        };
+    }
+
+    fn readData(self: *Self) !types.Data {
+        const mem_idx = try self.readU32();
+        const offset_expr = try self.readExpr();
+        const init_bytes = try self.readVector(types.Byte, Self.readU8);
+
+        return .{
+            .mem = mem_idx,
+            .offset = offset_expr,
+            .init = init_bytes,
+        };
+    }
+
     const SequenceResult = struct {
-        instructions: std.ArrayList(types.Instr),
+        instructions: []types.Instr,
         terminator: u8,
     };
 
-    fn readInstructionSequence(self: *Self, terminators: []const u8) !SequenceResult {
-        var instructions = try std.ArrayList(types.Instr).initCapacity(self.allocator, 0);
-        errdefer instructions.deinit();
+    const else_op_code = 0x05;
+    const end_op_code = 0x0B;
+
+    fn readInstructionSequence(self: *Self, terminators: []const u8) anyerror!SequenceResult {
+        var instructions = try std.ArrayList(types.Instr).initCapacity(self.allocator, 32);
+        errdefer instructions.deinit(self.allocator);
 
         while (true) {
             const next_byte = try self.peekByte();
 
             for (terminators) |t| {
                 if (next_byte == t) {
-                    _ = try self.readByte(); // Consume the terminator
-                    return .{ .instructions = instructions, .terminator = t };
+                    self.index += 1; // Consume the terminator
+                    return .{ .instructions = try instructions.toOwnedSlice(self.allocator), .terminator = t };
                 }
             }
 
             // It's not a terminator, so it must be an instruction
             const instr = try self.readInstr();
-            try instructions.append(instr);
+            try instructions.append(self.allocator, instr);
         }
     }
 
@@ -239,26 +344,25 @@ const Parser = struct {
             0x01 => .nop,
             0x02, 0x03 => |op| {
                 const block_type = try self.readBlockType();
-                const res = try self.readInstructionSequence(&.{0x0B});
-                const instructions = try res.instructions.toOwnedSlice();
+                const res = try self.readInstructionSequence(&.{end_op_code});
 
                 if (op == 0x02) {
-                    return .{ .block = .{ .block_type = block_type, .instructions = instructions } };
+                    return .{ .block = .{ .block_type = block_type, .instructions = res.instructions } };
                 } else {
-                    return .{ .loop = .{ .block_type = block_type, .instructions = instructions } };
+                    return .{ .loop = .{ .block_type = block_type, .instructions = res.instructions } };
                 }
             },
             0x04 => {
                 const block_type = try self.readBlockType();
 
                 // Read the "then" block, which can end with 0x0B (end) or 0x05 (else)
-                const then_res = try self.readInstructionSequence(&.{ 0x0B, 0x05 });
-                const then_instructions = try then_res.instructions.toOwnedSlice();
+                const then_res = try self.readInstructionSequence(&.{ else_op_code, end_op_code });
+                const then_instructions = then_res.instructions;
                 var else_instructions: []types.Instr = &.{};
 
-                if (then_res.terminator == 0x05) {
-                    const else_res = try self.readInstructionSequence(&.{0x0B});
-                    else_instructions = try else_res.instructions.toOwnedSlice();
+                if (then_res.terminator == else_op_code) {
+                    const else_res = try self.readInstructionSequence(&.{end_op_code});
+                    else_instructions = else_res.instructions;
                 }
 
                 return .{
@@ -328,22 +432,22 @@ const Parser = struct {
             0x3D => .{ .i64_store16 = try self.readMemArg() },
             0x3E => .{ .i64_store32 = try self.readMemArg() },
             0x3F => {
-                const mem_idx: types.MemIndex = try self.readByte();
+                const reserved = try self.readByte();
 
-                if (mem_idx != 0x00) {
+                if (reserved != 0x00) {
                     return error.InvalidMemoryInstruction;
                 }
 
-                return .{ .memory_size = mem_idx };
+                return .{ .memory_size = @intCast(reserved) };
             },
             0x40 => {
-                const mem_idx: types.MemIndex = try self.readByte();
+                const reserved = try self.readByte();
 
-                if (mem_idx != 0x00) {
+                if (reserved != 0x00) {
                     return error.InvalidMemoryInstruction;
                 }
 
-                return .{ .memory_grow = mem_idx };
+                return .{ .memory_grow = @intCast(reserved) };
             },
             0x41 => .{ .i32_const = try self.readI32() },
             0x42 => .{ .i64_const = try self.readI64() },
@@ -476,16 +580,187 @@ const Parser = struct {
             else => return error.InvalidInstruction,
         };
     }
+
+    fn readExpr(self: *Self) ![]types.Instr {
+        return (try self.readInstructionSequence(&.{end_op_code})).instructions;
+    }
+
+    fn readSectionHeader(self: *Self, expected_id: u8) !?u32 {
+        const next_byte = self.peekByte() catch |err| {
+            if (err == error.EndOfInput) return null;
+            return err;
+        };
+
+        if (next_byte == expected_id) {
+            self.index += 1; // Consume ID
+            return try self.readU32(); // Consume Size
+        }
+        return null;
+    }
+
+    fn readCustomSection(self: *Self, size: u32) !types.CustomSection {
+        const name = try self.readName();
+        const content_size = size - @as(u32, @intCast(name.len));
+        const content = self.bytes[self.index .. self.index + @as(usize, content_size)];
+        self.index += @as(usize, content_size);
+        return .{ .name = name, .data = content };
+    }
+
+    fn readCustomSections(self: *Self, container: *std.ArrayList(types.CustomSection)) !void {
+        while (true) {
+            const saved_index = self.index;
+            const next_byte = self.peekByte() catch |err| {
+                if (err == error.EndOfInput) return;
+                return err;
+            };
+
+            if (next_byte != 0) {
+                // Not a custom section
+                self.index = saved_index;
+                return;
+            }
+
+            self.index += 1; // consume the section id
+            const size = try self.readU32();
+            const custom_section = try self.readCustomSection(size);
+            try container.append(self.allocator, custom_section);
+        }
+    }
+
+    fn readTypeSection(self: *Self) ![]types.FuncType {
+        const size = try self.readSectionHeader(1) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.FuncType, Self.readFuncType);
+    }
+
+    fn readImportSection(self: *Self) ![]types.Import {
+        const size = try self.readSectionHeader(2) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.Import, Self.readImport);
+    }
+
+    fn readFunctionSection(self: *Self) ![]types.FuncIndex {
+        const size = try self.readSectionHeader(3) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.FuncIndex, Self.readU32);
+    }
+
+    fn readTableSection(self: *Self) ![]types.TableType {
+        const size = try self.readSectionHeader(4) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.TableType, Self.readTableType);
+    }
+
+    fn readMemorySection(self: *Self) ![]types.MemType {
+        const size = try self.readSectionHeader(5) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.MemType, Self.readMemType);
+    }
+
+    fn readGlobalSection(self: *Self) ![]types.Global {
+        const size = try self.readSectionHeader(6) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.Global, Self.readGlobal);
+    }
+
+    fn readExportSection(self: *Self) ![]types.Export {
+        const size = try self.readSectionHeader(7) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.Export, Self.readExport);
+    }
+
+    fn readStartSection(self: *Self) !?types.FuncIndex {
+        const size = try self.readSectionHeader(8) orelse return null;
+        _ = size;
+        return try self.readU32();
+    }
+
+    fn readElementSection(self: *Self) ![]types.Elem {
+        const size = try self.readSectionHeader(9) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.Elem, Self.readElem);
+    }
+
+    fn readCodeSection(self: *Self) ![]types.Code {
+        const size = try self.readSectionHeader(10) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.Code, Self.readCode);
+    }
+
+    fn readDataSection(self: *Self) ![]types.Data {
+        const size = try self.readSectionHeader(11) orelse return &.{};
+        _ = size;
+        return try self.readVector(types.Data, Self.readData);
+    }
+
+    fn readModule(self: *Self) !types.Module {
+        var custom_sections = try std.ArrayList(types.CustomSection).initCapacity(self.allocator, 0);
+        defer custom_sections.deinit(self.allocator);
+
+        const magic_number = try self.readFixedU32();
+        if (magic_number != 0x6d736100) {
+            return error.InvalidMagicNumber;
+        }
+
+        const version = try self.readFixedU32();
+        if (version != 0x1) {
+            return error.UnsupportedVersion;
+        }
+
+        try self.readCustomSections(&custom_sections);
+        const types_ = try self.readTypeSection();
+        try self.readCustomSections(&custom_sections);
+        const imports = try self.readImportSection();
+        try self.readCustomSections(&custom_sections);
+        const functions = try self.readFunctionSection();
+        try self.readCustomSections(&custom_sections);
+        const tables = try self.readTableSection();
+        try self.readCustomSections(&custom_sections);
+        const memories = try self.readMemorySection();
+        try self.readCustomSections(&custom_sections);
+        const globals = try self.readGlobalSection();
+        try self.readCustomSections(&custom_sections);
+        const exports = try self.readExportSection();
+        try self.readCustomSections(&custom_sections);
+        const start = try self.readStartSection();
+        try self.readCustomSections(&custom_sections);
+        const elements = try self.readElementSection();
+        try self.readCustomSections(&custom_sections);
+        const codes = try self.readCodeSection();
+        try self.readCustomSections(&custom_sections);
+        const data = try self.readDataSection();
+        try self.readCustomSections(&custom_sections);
+
+        return types.Module{
+            .custom = try custom_sections.toOwnedSlice(self.allocator),
+            .types = types_,
+            .imports = imports,
+            .functions = functions,
+            .tables = tables,
+            .memories = memories,
+            .globals = globals,
+            .exports = exports,
+            .start = start,
+            .elements = elements,
+            .codes = codes,
+            .data = data,
+        };
+    }
 };
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+const expectEqualSlices = std.testing.expectEqualSlices;
 
 test "readByte" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var parser = Parser.init(arena.allocator(), &[_]u8{ 1, 2, 3 });
-    try std.testing.expectEqual(@as(u8, 1), try parser.readByte());
-    try std.testing.expectEqual(@as(u8, 2), try parser.readByte());
-    try std.testing.expectEqual(@as(u8, 3), try parser.readByte());
+    try expectEqual(@as(u8, 1), try parser.readByte());
+    try expectEqual(@as(u8, 2), try parser.readByte());
+    try expectEqual(@as(u8, 3), try parser.readByte());
 }
 
 test "readU32" {
@@ -496,7 +771,7 @@ test "readU32" {
     var fbs = std.io.fixedBufferStream(&buffer);
     try std.leb.writeUleb128(fbs.writer(), @as(u32, 1998));
     var parser = Parser.init(arena.allocator(), buffer[0..]);
-    try std.testing.expectEqual(@as(u32, 1998), try parser.readU32());
+    try expectEqual(@as(u32, 1998), try parser.readU32());
 }
 
 test "readF32" {
@@ -509,7 +784,7 @@ test "readF32" {
     const val: f32 = 3.14;
     try writer.writeInt(u32, @bitCast(val), .little);
     var parser = Parser.init(arena.allocator(), buffer[0..]);
-    try std.testing.expectEqual(val, try parser.readF32());
+    try expectEqual(val, try parser.readF32());
 }
 
 test "readF64" {
@@ -522,7 +797,7 @@ test "readF64" {
     const val: f64 = 3.14;
     try writer.writeInt(u64, @bitCast(val), .little);
     var parser = Parser.init(arena.allocator(), buffer[0..]);
-    try std.testing.expectEqual(val, try parser.readF64());
+    try expectEqual(val, try parser.readF64());
 }
 
 test "readVector" {
@@ -539,9 +814,9 @@ test "readVector" {
 
     var parser = Parser.init(arena.allocator(), buffer[0..]);
     const vec = try parser.readVector(u16, Parser.readU16);
-    try std.testing.expectEqual(@as(u16, 1), vec[0]);
-    try std.testing.expectEqual(@as(u16, 2), vec[1]);
-    try std.testing.expectEqual(@as(u16, 3), vec[2]);
+    try expectEqual(@as(u16, 1), vec[0]);
+    try expectEqual(@as(u16, 2), vec[1]);
+    try expectEqual(@as(u16, 3), vec[2]);
 }
 
 test "readFunc" {
@@ -552,9 +827,113 @@ test "readFunc" {
     var parser = Parser.init(arena.allocator(), buffer[0..]);
     const func_type = try parser.readFuncType();
 
-    try std.testing.expectEqual(@as(usize, 2), func_type.params.len);
-    try std.testing.expectEqual(types.ValType.i32, func_type.params[0]);
-    try std.testing.expectEqual(types.ValType.i64, func_type.params[1]);
-    try std.testing.expectEqual(@as(usize, 1), func_type.results.len);
-    try std.testing.expectEqual(types.ValType.f32, func_type.results[0]);
+    try expectEqual(@as(usize, 2), func_type.params.len);
+    try expectEqual(types.ValType.i32, func_type.params[0]);
+    try expectEqual(types.ValType.i64, func_type.params[1]);
+    try expectEqual(@as(usize, 1), func_type.results.len);
+    try expectEqual(types.ValType.f32, func_type.results[0]);
+}
+
+test "readModule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const file = try std.fs.cwd().openFile("res/fact.wasm", .{});
+    defer file.close();
+
+    const bytes = try file.readToEndAlloc(arena.allocator(), 128);
+    var parser = Parser.init(arena.allocator(), bytes);
+    const module = try parser.readModule();
+
+    try expectEqual(module.types.len, 2);
+    try expectEqualSlices(types.ValType, module.types[0].params, &[_]types.ValType{.i32});
+    try expectEqualSlices(types.ValType, module.types[0].results, &[_]types.ValType{.i32});
+
+    try expectEqualSlices(types.ValType, module.types[1].params, &[_]types.ValType{});
+    try expectEqualSlices(types.ValType, module.types[1].results, &[_]types.ValType{.i32});
+
+    try expectEqual(module.functions.len, 2);
+    try expectEqual(@as(u32, 0), module.functions[0]);
+    try expectEqual(@as(u32, 1), module.functions[1]);
+
+    try expectEqual(module.exports.len, 3);
+    try expectEqualStrings("memory", module.exports[0].name);
+    try expectEqualStrings("fact", module.exports[1].name);
+    try expectEqualStrings("main", module.exports[2].name);
+
+    try expectEqual(module.codes.len, 2);
+    const code = module.codes[0];
+    const body = code.body;
+
+    // Check body length: local.get, i32.eqz, if
+    try expectEqual(@as(usize, 3), body.len);
+
+    // 1. local.get 0
+    try expectEqual(types.Instr{ .local_get = 0 }, body[0]);
+
+    // 2. i32.eqz
+    try expectEqual(types.Instr.i32_eqz, body[1]);
+
+    // 3. if
+    switch (body[2]) {
+        .@"if" => |if_instr| {
+            try expectEqual(types.BlockType{ .val_type = .i32 }, if_instr.block_type);
+
+            // Check 'then' branch
+            const then_instrs = if_instr.then_instructions;
+            try expectEqual(@as(usize, 1), then_instrs.len);
+            try expectEqual(types.Instr{ .i32_const = 1 }, then_instrs[0]);
+
+            // Check 'else' branch
+            const else_instrs = if_instr.else_instructions;
+            try expectEqual(@as(usize, 6), else_instrs.len);
+
+            try expectEqual(types.Instr{ .local_get = 0 }, else_instrs[0]);
+            try expectEqual(types.Instr{ .local_get = 0 }, else_instrs[1]);
+            try expectEqual(types.Instr{ .i32_const = 1 }, else_instrs[2]);
+            try expectEqual(types.Instr.i32_sub, else_instrs[3]);
+            try expectEqual(types.Instr{ .call = 0 }, else_instrs[4]);
+            try expectEqual(types.Instr.i32_mul, else_instrs[5]);
+        },
+        else => try expect(false),
+    }
+
+    // Imports
+    try expectEqual(module.imports.len, 0);
+
+    // Tables
+    try expectEqual(module.tables.len, 1);
+    try expectEqual(types.ElemType.func_ref, module.tables[0].elem_type);
+    try expectEqual(@as(u32, 2), module.tables[0].limits.min);
+    try expectEqual(@as(?u32, 2), module.tables[0].limits.max);
+
+    // Memories
+    try expectEqual(module.memories.len, 1);
+    try expectEqual(@as(u32, 16), module.memories[0].limits.min);
+    try expectEqual(@as(?u32, null), module.memories[0].limits.max);
+
+    // Globals
+    try expectEqual(module.globals.len, 1);
+    try expectEqual(types.ValType.i32, module.globals[0].type.val_type);
+    try expectEqual(true, module.globals[0].type.mutable);
+    try expectEqual(@as(usize, 1), module.globals[0].init.len);
+    try expectEqual(types.Instr{ .i32_const = 0 }, module.globals[0].init[0]);
+
+    // Start
+    try expectEqual(@as(?u32, null), module.start);
+
+    // Elements
+    try expectEqual(module.elements.len, 1);
+    try expectEqual(@as(u32, 0), module.elements[0].table);
+    try expectEqual(@as(usize, 1), module.elements[0].offset.len);
+    try expectEqual(types.Instr{ .i32_const = 0 }, module.elements[0].offset[0]);
+    try expectEqual(@as(usize, 2), module.elements[0].init.len);
+    try expectEqual(@as(u32, 0), module.elements[0].init[0]);
+    try expectEqual(@as(u32, 1), module.elements[0].init[1]);
+
+    // Data
+    try expectEqual(module.data.len, 0);
+
+    // Custom sections
+    try expectEqual(module.custom.len, 0);
 }

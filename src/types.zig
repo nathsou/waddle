@@ -27,6 +27,7 @@ pub const ResultType = []ValType;
 pub const BlockType = union(enum) {
     empty,
     val_type: ValType,
+    type_index: TypeIndex,
 };
 
 pub const FuncType = struct {
