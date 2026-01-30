@@ -168,6 +168,10 @@ const Parser = struct {
         const params = try self.readVector(types.ValType, Self.readValType);
         const results = try self.readVector(types.ValType, Self.readValType);
 
+        if (results.len > 1) {
+            return error.MultipleResultTypesNotSupported;
+        }
+
         return .{ .params = params, .results = results };
     }
 
@@ -179,6 +183,11 @@ const Parser = struct {
             0x00 => return .{ .min = min, .max = null },
             0x01 => {
                 const max = try self.readU32();
+
+                if (max < min) {
+                    return error.InvalidLimits;
+                }
+
                 return .{ .min = min, .max = max };
             },
             else => return error.InvalidLimits,
@@ -187,6 +196,13 @@ const Parser = struct {
 
     fn readMemType(self: *Self) !types.MemType {
         const limits = try self.readLimits();
+
+        if (limits.max) |max| {
+            if (max > 65536) {
+                return error.InvalidMemoryLimits;
+            }
+        }
+
         return .{ .limits = limits };
     }
 
@@ -628,68 +644,57 @@ const Parser = struct {
     }
 
     fn readTypeSection(self: *Self) ![]types.FuncType {
-        const size = try self.readSectionHeader(1) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(1) orelse return &.{};
         return try self.readVector(types.FuncType, Self.readFuncType);
     }
 
     fn readImportSection(self: *Self) ![]types.Import {
-        const size = try self.readSectionHeader(2) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(2) orelse return &.{};
         return try self.readVector(types.Import, Self.readImport);
     }
 
     fn readFunctionSection(self: *Self) ![]types.FuncIndex {
-        const size = try self.readSectionHeader(3) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(3) orelse return &.{};
         return try self.readVector(types.FuncIndex, Self.readU32);
     }
 
     fn readTableSection(self: *Self) ![]types.TableType {
-        const size = try self.readSectionHeader(4) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(4) orelse return &.{};
         return try self.readVector(types.TableType, Self.readTableType);
     }
 
     fn readMemorySection(self: *Self) ![]types.MemType {
-        const size = try self.readSectionHeader(5) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(5) orelse return &.{};
         return try self.readVector(types.MemType, Self.readMemType);
     }
 
     fn readGlobalSection(self: *Self) ![]types.Global {
-        const size = try self.readSectionHeader(6) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(6) orelse return &.{};
         return try self.readVector(types.Global, Self.readGlobal);
     }
 
     fn readExportSection(self: *Self) ![]types.Export {
-        const size = try self.readSectionHeader(7) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(7) orelse return &.{};
         return try self.readVector(types.Export, Self.readExport);
     }
 
     fn readStartSection(self: *Self) !?types.FuncIndex {
-        const size = try self.readSectionHeader(8) orelse return null;
-        _ = size;
+        _ = try self.readSectionHeader(8) orelse return null;
         return try self.readU32();
     }
 
     fn readElementSection(self: *Self) ![]types.Elem {
-        const size = try self.readSectionHeader(9) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(9) orelse return &.{};
         return try self.readVector(types.Elem, Self.readElem);
     }
 
     fn readCodeSection(self: *Self) ![]types.Code {
-        const size = try self.readSectionHeader(10) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(10) orelse return &.{};
         return try self.readVector(types.Code, Self.readCode);
     }
 
     fn readDataSection(self: *Self) ![]types.Data {
-        const size = try self.readSectionHeader(11) orelse return &.{};
-        _ = size;
+        _ = try self.readSectionHeader(11) orelse return &.{};
         return try self.readVector(types.Data, Self.readData);
     }
 
@@ -845,22 +850,25 @@ test "readModule" {
     var parser = Parser.init(arena.allocator(), bytes);
     const module = try parser.readModule();
 
+    // Types
     try expectEqual(module.types.len, 2);
     try expectEqualSlices(types.ValType, module.types[0].params, &[_]types.ValType{.i32});
     try expectEqualSlices(types.ValType, module.types[0].results, &[_]types.ValType{.i32});
-
     try expectEqualSlices(types.ValType, module.types[1].params, &[_]types.ValType{});
     try expectEqualSlices(types.ValType, module.types[1].results, &[_]types.ValType{.i32});
 
+    // Functions
     try expectEqual(module.functions.len, 2);
     try expectEqual(@as(u32, 0), module.functions[0]);
     try expectEqual(@as(u32, 1), module.functions[1]);
 
+    // Exports
     try expectEqual(module.exports.len, 3);
     try expectEqualStrings("memory", module.exports[0].name);
     try expectEqualStrings("fact", module.exports[1].name);
     try expectEqualStrings("main", module.exports[2].name);
 
+    // Codes
     try expectEqual(module.codes.len, 2);
     const code = module.codes[0];
     const body = code.body;
