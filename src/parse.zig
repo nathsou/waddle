@@ -14,7 +14,7 @@ const types = @import("types.zig");
 ///     var parser = Parser.init(arena.allocator(), wasm_bytes);
 ///     const module = try parser.parseModule();
 ///     // All allocations are freed when arena.deinit() is called
-const Parser = struct {
+pub const Parser = struct {
     const Self = @This();
     bytes: []const u8,
     index: usize = 0,
@@ -698,7 +698,7 @@ const Parser = struct {
         return try self.readVector(types.Data, Self.readData);
     }
 
-    fn readModule(self: *Self) !types.Module {
+    pub fn readModule(self: *Self) !types.Module {
         var custom_sections = try std.ArrayList(types.CustomSection).initCapacity(self.allocator, 0);
         defer custom_sections.deinit(self.allocator);
 
