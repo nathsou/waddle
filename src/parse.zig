@@ -851,16 +851,19 @@ test "readModule" {
     const module = try parser.readModule();
 
     // Types
-    try expectEqual(module.types.len, 2);
+    try expectEqual(module.types.len, 3);
     try expectEqualSlices(types.ValType, module.types[0].params, &[_]types.ValType{.i32});
     try expectEqualSlices(types.ValType, module.types[0].results, &[_]types.ValType{.i32});
     try expectEqualSlices(types.ValType, module.types[1].params, &[_]types.ValType{});
     try expectEqualSlices(types.ValType, module.types[1].results, &[_]types.ValType{.i32});
+    try expectEqualSlices(types.ValType, module.types[2].params, &[_]types.ValType{});
+    try expectEqualSlices(types.ValType, module.types[2].results, &[_]types.ValType{});
 
     // Functions
-    try expectEqual(module.functions.len, 2);
+    try expectEqual(module.functions.len, 3);
     try expectEqual(@as(u32, 0), module.functions[0]);
     try expectEqual(@as(u32, 1), module.functions[1]);
+    try expectEqual(@as(u32, 2), module.functions[2]);
 
     // Exports
     try expectEqual(module.exports.len, 3);
@@ -869,7 +872,7 @@ test "readModule" {
     try expectEqualStrings("main", module.exports[2].name);
 
     // Codes
-    try expectEqual(module.codes.len, 2);
+    try expectEqual(module.codes.len, 3);
     const code = module.codes[0];
     const body = code.body;
 
@@ -928,7 +931,7 @@ test "readModule" {
     try expectEqual(types.Instr{ .i32_const = 0 }, module.globals[0].init[0]);
 
     // Start
-    try expectEqual(@as(?u32, null), module.start);
+    try expectEqual(@as(?u32, 2), module.start);
 
     // Elements
     try expectEqual(module.elements.len, 1);

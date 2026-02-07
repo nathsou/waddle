@@ -20,7 +20,34 @@ pub const ValType = enum {
     i64,
     f32,
     f64,
+
+    pub fn defaultValue(self: ValType) Value {
+        return switch (self) {
+            .i32 => .{ .i32 = 0 },
+            .i64 => .{ .i64 = 0 },
+            .f32 => .{ .f32 = 0 },
+            .f64 => .{ .f64 = 0 },
+        };
+    }
 };
+
+pub const Value = union(enum) {
+    i32: i32,
+    i64: i64,
+    f32: f32,
+    f64: f64,
+
+    pub fn getType(self: Value) ValType {
+        return switch (self) {
+            .i32 => .i32,
+            .i64 => .i64,
+            .f32 => .f32,
+            .f64 => .f64,
+        };
+    }
+};
+
+pub const Result = Value;
 
 pub const ResultType = []ValType;
 
