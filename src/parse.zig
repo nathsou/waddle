@@ -402,7 +402,7 @@ pub const Parser = struct {
                 const default_idx = try self.readU32();
                 return .{ .br_table = .{ .label_indices = labels, .default_idx = default_idx } };
             },
-            0x0F => .return_op,
+            0x0F => .@"return",
             0x10 => {
                 const func_idx = try self.readU32();
                 return .{ .call = func_idx };

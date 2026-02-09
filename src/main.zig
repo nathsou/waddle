@@ -17,4 +17,13 @@ pub fn main() !void {
     const module = try parser.readModule();
     _ = try store.instantiate(arena.allocator(), module, &.{});
     std.debug.print("{any}\n", .{store.funcs.items[0].wasm.code.body});
+
+    var lowering = try runtime.BytecodeLowering.init(allocator, store.funcs.items.len);
+    defer lowering.deinit();
+    try lowering.lowerStore(&store);
+
+    std.debug.print("Lowered bytecode:\n", .{});
+    for (lowering.flat.items) |instr| {
+        std.debug.print("{any}\n", .{instr});
+    }
 }

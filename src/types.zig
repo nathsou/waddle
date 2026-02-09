@@ -113,7 +113,7 @@ pub const Instr = union(enum) {
     br: LabelIndex,
     br_if: LabelIndex,
     br_table: struct { label_indices: []LabelIndex, default_idx: LabelIndex },
-    return_op,
+    @"return",
     call: FuncIndex,
     call_indirect: struct { type_idx: TypeIndex, table_idx: TableIndex },
 

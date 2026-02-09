@@ -3,6 +3,568 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const Value = types.Value;
+const LocalIndex = types.LocalIndex;
+const GlobalIndex = types.GlobalIndex;
+const MemoryInstrArg = types.MemoryInstrArg;
+const MemIndex = types.MemIndex;
+
+const PC = usize;
+
+pub const FlatInstr = union(enum) {
+    // Control instructions
+    @"unreachable",
+    nop,
+    br: PC,
+    br_if: PC,
+    br_table: struct { label_indices: []PC, default_idx: PC },
+    @"return",
+    call: PC,
+
+    // Parametric instructions
+    drop,
+    select,
+
+    // Variable instructions
+    local_get: LocalIndex,
+    local_set: LocalIndex,
+    local_tee: LocalIndex,
+    global_get: GlobalIndex,
+    global_set: GlobalIndex,
+
+    // Memory instructions
+    i32_load: MemoryInstrArg,
+    i64_load: MemoryInstrArg,
+    f32_load: MemoryInstrArg,
+    f64_load: MemoryInstrArg,
+    i32_load8_s: MemoryInstrArg,
+    i32_load8_u: MemoryInstrArg,
+    i32_load16_s: MemoryInstrArg,
+    i32_load16_u: MemoryInstrArg,
+    i64_load8_s: MemoryInstrArg,
+    i64_load8_u: MemoryInstrArg,
+    i64_load16_s: MemoryInstrArg,
+    i64_load16_u: MemoryInstrArg,
+    i64_load32_s: MemoryInstrArg,
+    i64_load32_u: MemoryInstrArg,
+    i32_store: MemoryInstrArg,
+    i64_store: MemoryInstrArg,
+    f32_store: MemoryInstrArg,
+    f64_store: MemoryInstrArg,
+    i32_store8: MemoryInstrArg,
+    i32_store16: MemoryInstrArg,
+    i64_store8: MemoryInstrArg,
+    i64_store16: MemoryInstrArg,
+    i64_store32: MemoryInstrArg,
+    memory_size: MemIndex,
+    memory_grow: MemIndex,
+
+    // Numeric instructions
+    i32_const: i32,
+    i64_const: i64,
+    f32_const: f32,
+    f64_const: f64,
+    i32_eqz,
+    i32_eq,
+    i32_ne,
+    i32_lt_s,
+    i32_lt_u,
+    i32_gt_s,
+    i32_gt_u,
+    i32_le_s,
+    i32_le_u,
+    i32_ge_s,
+    i32_ge_u,
+    i64_eqz,
+    i64_eq,
+    i64_ne,
+    i64_lt_s,
+    i64_lt_u,
+    i64_gt_s,
+    i64_gt_u,
+    i64_le_s,
+    i64_le_u,
+    i64_ge_s,
+    i64_ge_u,
+    f32_eq,
+    f32_ne,
+    f32_lt,
+    f32_gt,
+    f32_le,
+    f32_ge,
+    f64_eq,
+    f64_ne,
+    f64_lt,
+    f64_gt,
+    f64_le,
+    f64_ge,
+    i32_clz,
+    i32_ctz,
+    i32_popcnt,
+    i32_add,
+    i32_sub,
+    i32_mul,
+    i32_div_s,
+    i32_div_u,
+    i32_rem_s,
+    i32_rem_u,
+    i32_and,
+    i32_or,
+    i32_xor,
+    i32_shl,
+    i32_shr_s,
+    i32_shr_u,
+    i32_rotl,
+    i32_rotr,
+    i64_clz,
+    i64_ctz,
+    i64_popcnt,
+    i64_add,
+    i64_sub,
+    i64_mul,
+    i64_div_s,
+    i64_div_u,
+    i64_rem_s,
+    i64_rem_u,
+    i64_and,
+    i64_or,
+    i64_xor,
+    i64_shl,
+    i64_shr_s,
+    i64_shr_u,
+    i64_rotl,
+    i64_rotr,
+    f32_abs,
+    f32_neg,
+    f32_ceil,
+    f32_floor,
+    f32_trunc,
+    f32_nearest,
+    f32_sqrt,
+    f32_add,
+    f32_sub,
+    f32_mul,
+    f32_div,
+    f32_min,
+    f32_max,
+    f32_copysign,
+    f64_abs,
+    f64_neg,
+    f64_ceil,
+    f64_floor,
+    f64_trunc,
+    f64_nearest,
+    f64_sqrt,
+    f64_add,
+    f64_sub,
+    f64_mul,
+    f64_div,
+    f64_min,
+    f64_max,
+    f64_copysign,
+    i32_wrap_i64,
+    i32_trunc_f32_s,
+    i32_trunc_f32_u,
+    i32_trunc_f64_s,
+    i32_trunc_f64_u,
+    i64_extend_i32_s,
+    i64_extend_i32_u,
+    i64_trunc_f32_s,
+    i64_trunc_f32_u,
+    i64_trunc_f64_s,
+    i64_trunc_f64_u,
+    f32_convert_i32_s,
+    f32_convert_i32_u,
+    f32_convert_i64_s,
+    f32_convert_i64_u,
+    f32_demote_f64,
+    f64_convert_i32_s,
+    f64_convert_i32_u,
+    f64_convert_i64_s,
+    f64_convert_i64_u,
+    f64_promote_f32,
+    i32_reinterpret_f32,
+    i64_reinterpret_f64,
+    f32_reinterpret_i32,
+    f64_reinterpret_i64,
+};
+
+pub const BlockLabelKind = enum { block, loop, @"if" };
+pub const BlockLabel = struct {
+    kind: BlockLabelKind,
+    start: PC,
+    end: PC,
+    branches_to_patch: ArrayList(usize),
+
+    fn deinit(self: *BlockLabel, allocator: Allocator) void {
+        self.branches_to_patch.deinit(allocator);
+    }
+};
+
+pub const FuncLabel = struct {
+    entry: PC,
+    calls_to_patch: ArrayList(usize),
+
+    fn deinit(self: *FuncLabel, allocator: Allocator) void {
+        self.calls_to_patch.deinit(allocator);
+    }
+};
+
+pub const BytecodeLowering = struct {
+    allocator: Allocator,
+    instrs: ArrayList(FlatInstr),
+    block_labels: ArrayList(BlockLabel),
+    func_labels: []FuncLabel,
+    flat: ArrayList(FlatInstr),
+
+    pub fn init(allocator: Allocator, function_count: usize) !BytecodeLowering {
+        const func_labels = try allocator.alloc(FuncLabel, function_count);
+
+        for (func_labels) |*label| {
+            label.* = FuncLabel{
+                .entry = 0,
+                .calls_to_patch = .empty,
+            };
+        }
+
+        return BytecodeLowering{
+            .allocator = allocator,
+            .instrs = .empty,
+            .block_labels = .empty,
+            .func_labels = func_labels,
+            .flat = .empty,
+        };
+    }
+
+    pub fn deinit(self: *BytecodeLowering) void {
+        self.instrs.deinit(self.allocator);
+
+        for (self.block_labels.items) |*label| {
+            label.deinit(self.allocator);
+        }
+
+        self.block_labels.deinit(self.allocator);
+
+        for (self.func_labels) |*label| {
+            label.deinit(self.allocator);
+        }
+
+        self.allocator.free(self.func_labels);
+
+        self.flat.deinit(self.allocator);
+    }
+
+    fn emit(self: *BytecodeLowering, instr: FlatInstr) !void {
+        try self.flat.append(self.allocator, instr);
+    }
+
+    pub fn lowerStore(self: *BytecodeLowering, store: *Store) !void {
+        for (store.funcs.items, 0..) |func, i| {
+            try self.lowerFunc(func.wasm.code, i);
+        }
+
+        // Patch call instructions with actual function addresses
+        for (self.func_labels) |func_label| {
+            for (func_label.calls_to_patch.items) |call_idx| {
+                switch (self.flat.items[call_idx]) {
+                    .call => |*pc| {
+                        pc.* = func_label.entry;
+                    },
+                    else => {
+                        return error.InvalidCallInstructionForPatching;
+                    },
+                }
+            }
+        }
+    }
+
+    fn lowerFunc(self: *BytecodeLowering, func: types.Func, func_index: usize) !void {
+        // record the start of the function
+        self.func_labels[func_index].entry = self.flat.items.len;
+
+        for (func.body) |instr| {
+            try self.lower(instr);
+        }
+
+        try self.emit(.@"return");
+    }
+
+    fn patchBranches(self: *BytecodeLowering, label: BlockLabel) !void {
+        for (label.branches_to_patch.items) |branch_idx| {
+            switch (self.flat.items[branch_idx]) {
+                .br => |*pc| {
+                    pc.* = label.start;
+                },
+                .br_if => |*pc| {
+                    pc.* = label.start;
+                },
+                else => {
+                    return error.InvalidBranchInstructionForPatching;
+                },
+            }
+        }
+    }
+
+    fn lower(self: *BytecodeLowering, instr: types.Instr) !void {
+        switch (instr) {
+            .@"unreachable" => try self.emit(.@"unreachable"),
+            .nop => try self.emit(.nop),
+            .block, .loop => |block| {
+                const label_kind: BlockLabelKind = switch (instr) {
+                    .block => .block,
+                    .loop => .loop,
+                    else => unreachable,
+                };
+
+                var label = BlockLabel{
+                    .kind = label_kind,
+                    .start = self.flat.items.len,
+                    .end = 0, // To be patched
+                    .branches_to_patch = .empty,
+                };
+
+                try self.block_labels.append(self.allocator, label);
+
+                for (block.instructions) |block_instr| {
+                    try self.lower(block_instr);
+                }
+
+                if (label_kind == .block) {
+                    label.end = self.flat.items.len;
+                    try self.patchBranches(label);
+                }
+
+                self.block_labels.items.len -= 1; // Pop the label
+            },
+            .@"if" => |if_| {
+                var exit_label = BlockLabel{
+                    .kind = .@"if",
+                    .start = self.flat.items.len,
+                    .end = 0, // To be patched
+                    .branches_to_patch = .empty,
+                };
+                defer exit_label.deinit(self.allocator);
+
+                // negate condition to skip then block if false
+                try self.emit(.i32_eqz);
+                const else_jump_idx = self.flat.items.len;
+                try self.emit(.{ .br_if = 0 }); // Placeholder for branch to else block
+                try self.block_labels.append(self.allocator, exit_label);
+
+                for (if_.then_instructions) |then_instr| {
+                    try self.lower(then_instr);
+                }
+
+                // Unconditionally jump to end of if after then block
+                try exit_label.branches_to_patch.append(self.allocator, self.flat.items.len);
+                try self.emit(.{ .br = 0 });
+                self.flat.items[else_jump_idx] = .{ .br_if = self.flat.items.len }; // Patch branch to else block
+
+                for (if_.else_instructions) |else_instr| {
+                    try self.lower(else_instr);
+                }
+
+                exit_label.end = self.flat.items.len;
+                try self.patchBranches(exit_label);
+            },
+            .br, .br_if => |label_idx| {
+                if (self.block_labels.items.len <= label_idx) {
+                    return error.InvalidLabelIndex;
+                }
+
+                const label = &self.block_labels.items[self.block_labels.items.len - 1 - label_idx];
+
+                switch (label.kind) {
+                    .loop => {
+                        // Branch to the start of the loop
+                        try self.emit(switch (instr) {
+                            .br => .{ .br = label.start },
+                            .br_if => .{ .br_if = label.start },
+                            else => unreachable,
+                        });
+                    },
+                    .block, .@"if" => {
+                        // Emit a placeholder branch instruction and record it for patching
+                        const patch_idx = self.flat.items.len;
+                        try label.branches_to_patch.append(self.allocator, patch_idx);
+                        try self.emit(switch (instr) {
+                            .br => .{ .br = 0 },
+                            .br_if => .{ .br_if = 0 },
+                            else => unreachable,
+                        });
+                    },
+                }
+            },
+            .call => |func_idx| {
+                const call_instr_idx = self.flat.items.len;
+                try self.emit(.{ .call = 0 }); // placeholder
+                std.debug.assert(func_idx < self.func_labels.len);
+                try self.func_labels[func_idx].calls_to_patch.append(self.allocator, call_instr_idx);
+            },
+            .drop => try self.emit(.drop),
+            .select => try self.emit(.select),
+            .local_get => |idx| try self.emit(.{ .local_get = idx }),
+            .local_set => |idx| try self.emit(.{ .local_set = idx }),
+            .local_tee => |idx| try self.emit(.{ .local_tee = idx }),
+            .global_get => |idx| try self.emit(.{ .global_get = idx }),
+            .global_set => |idx| try self.emit(.{ .global_set = idx }),
+            .i32_load => |arg| try self.emit(.{ .i32_load = arg }),
+            .i64_load => |arg| try self.emit(.{ .i64_load = arg }),
+            .f32_load => |arg| try self.emit(.{ .f32_load = arg }),
+            .f64_load => |arg| try self.emit(.{ .f64_load = arg }),
+            .i32_load8_s => |arg| try self.emit(.{ .i32_load8_s = arg }),
+            .i32_load8_u => |arg| try self.emit(.{ .i32_load8_u = arg }),
+            .i32_load16_s => |arg| try self.emit(.{ .i32_load16_s = arg }),
+            .i32_load16_u => |arg| try self.emit(.{ .i32_load16_u = arg }),
+            .i64_load8_s => |arg| try self.emit(.{ .i64_load8_s = arg }),
+            .i64_load8_u => |arg| try self.emit(.{ .i64_load8_u = arg }),
+            .i64_load16_s => |arg| try self.emit(.{ .i64_load16_s = arg }),
+            .i64_load16_u => |arg| try self.emit(.{ .i64_load16_u = arg }),
+            .i64_load32_s => |arg| try self.emit(.{ .i64_load32_s = arg }),
+            .i64_load32_u => |arg| try self.emit(.{ .i64_load32_u = arg }),
+            .i32_store => |arg| try self.emit(.{ .i32_store = arg }),
+            .i64_store => |arg| try self.emit(.{ .i64_store = arg }),
+            .f32_store => |arg| try self.emit(.{ .f32_store = arg }),
+            .f64_store => |arg| try self.emit(.{ .f64_store = arg }),
+            .i32_store8 => |arg| try self.emit(.{ .i32_store8 = arg }),
+            .i32_store16 => |arg| try self.emit(.{ .i32_store16 = arg }),
+            .i64_store8 => |arg| try self.emit(.{ .i64_store8 = arg }),
+            .i64_store16 => |arg| try self.emit(.{ .i64_store16 = arg }),
+            .i64_store32 => |arg| try self.emit(.{ .i64_store32 = arg }),
+            .memory_size => |idx| try self.emit(.{ .memory_size = idx }),
+            .memory_grow => |idx| try self.emit(.{ .memory_grow = idx }),
+            .i32_const => |n| try self.emit(.{ .i32_const = n }),
+            .i64_const => |n| try self.emit(.{ .i64_const = n }),
+            .f32_const => |x| try self.emit(.{ .f32_const = x }),
+            .f64_const => |x| try self.emit(.{ .f64_const = x }),
+            .i32_eqz => try self.emit(.i32_eqz),
+            .i32_eq => try self.emit(.i32_eq),
+            .i32_ne => try self.emit(.i32_ne),
+            .i32_lt_s => try self.emit(.i32_lt_s),
+            .i32_lt_u => try self.emit(.i32_lt_u),
+            .i32_gt_s => try self.emit(.i32_gt_s),
+            .i32_gt_u => try self.emit(.i32_gt_u),
+            .i32_le_s => try self.emit(.i32_le_s),
+            .i32_le_u => try self.emit(.i32_le_u),
+            .i32_ge_s => try self.emit(.i32_ge_s),
+            .i32_ge_u => try self.emit(.i32_ge_u),
+            .i64_eqz => try self.emit(.i64_eqz),
+            .i64_eq => try self.emit(.i64_eq),
+            .i64_ne => try self.emit(.i64_ne),
+            .i64_lt_s => try self.emit(.i64_lt_s),
+            .i64_lt_u => try self.emit(.i64_lt_u),
+            .i64_gt_s => try self.emit(.i64_gt_s),
+            .i64_gt_u => try self.emit(.i64_gt_u),
+            .i64_le_s => try self.emit(.i64_le_s),
+            .i64_le_u => try self.emit(.i64_le_u),
+            .i64_ge_s => try self.emit(.i64_ge_s),
+            .i64_ge_u => try self.emit(.i64_ge_u),
+            .f32_eq => try self.emit(.f32_eq),
+            .f32_ne => try self.emit(.f32_ne),
+            .f32_lt => try self.emit(.f32_lt),
+            .f32_gt => try self.emit(.f32_gt),
+            .f32_le => try self.emit(.f32_le),
+            .f32_ge => try self.emit(.f32_ge),
+            .f64_eq => try self.emit(.f64_eq),
+            .f64_ne => try self.emit(.f64_ne),
+            .f64_lt => try self.emit(.f64_lt),
+            .f64_gt => try self.emit(.f64_gt),
+            .f64_le => try self.emit(.f64_le),
+            .f64_ge => try self.emit(.f64_ge),
+            .i32_clz => try self.emit(.i32_clz),
+            .i32_ctz => try self.emit(.i32_ctz),
+            .i32_popcnt => try self.emit(.i32_popcnt),
+            .i32_add => try self.emit(.i32_add),
+            .i32_sub => try self.emit(.i32_sub),
+            .i32_mul => try self.emit(.i32_mul),
+            .i32_div_s => try self.emit(.i32_div_s),
+            .i32_div_u => try self.emit(.i32_div_u),
+            .i32_rem_s => try self.emit(.i32_rem_s),
+            .i32_rem_u => try self.emit(.i32_rem_u),
+            .i32_and => try self.emit(.i32_and),
+            .i32_or => try self.emit(.i32_or),
+            .i32_xor => try self.emit(.i32_xor),
+            .i32_shl => try self.emit(.i32_shl),
+            .i32_shr_s => try self.emit(.i32_shr_s),
+            .i32_shr_u => try self.emit(.i32_shr_u),
+            .i32_rotl => try self.emit(.i32_rotl),
+            .i32_rotr => try self.emit(.i32_rotr),
+            .i64_clz => try self.emit(.i64_clz),
+            .i64_ctz => try self.emit(.i64_ctz),
+            .i64_popcnt => try self.emit(.i64_popcnt),
+            .i64_add => try self.emit(.i64_add),
+            .i64_sub => try self.emit(.i64_sub),
+            .i64_mul => try self.emit(.i64_mul),
+            .i64_div_s => try self.emit(.i64_div_s),
+            .i64_div_u => try self.emit(.i64_div_u),
+            .i64_rem_s => try self.emit(.i64_rem_s),
+            .i64_rem_u => try self.emit(.i64_rem_u),
+            .i64_and => try self.emit(.i64_and),
+            .i64_or => try self.emit(.i64_or),
+            .i64_xor => try self.emit(.i64_xor),
+            .i64_shl => try self.emit(.i64_shl),
+            .i64_shr_s => try self.emit(.i64_shr_s),
+            .i64_shr_u => try self.emit(.i64_shr_u),
+            .i64_rotl => try self.emit(.i64_rotl),
+            .i64_rotr => try self.emit(.i64_rotr),
+            .f32_abs => try self.emit(.f32_abs),
+            .f32_neg => try self.emit(.f32_neg),
+            .f32_ceil => try self.emit(.f32_ceil),
+            .f32_floor => try self.emit(.f32_floor),
+            .f32_trunc => try self.emit(.f32_trunc),
+            .f32_nearest => try self.emit(.f32_nearest),
+            .f32_sqrt => try self.emit(.f32_sqrt),
+            .f32_add => try self.emit(.f32_add),
+            .f32_sub => try self.emit(.f32_sub),
+            .f32_mul => try self.emit(.f32_mul),
+            .f32_div => try self.emit(.f32_div),
+            .f32_min => try self.emit(.f32_min),
+            .f32_max => try self.emit(.f32_max),
+            .f32_copysign => try self.emit(.f32_copysign),
+            .f64_abs => try self.emit(.f64_abs),
+            .f64_neg => try self.emit(.f64_neg),
+            .f64_ceil => try self.emit(.f64_ceil),
+            .f64_floor => try self.emit(.f64_floor),
+            .f64_trunc => try self.emit(.f64_trunc),
+            .f64_nearest => try self.emit(.f64_nearest),
+            .f64_sqrt => try self.emit(.f64_sqrt),
+            .f64_add => try self.emit(.f64_add),
+            .f64_sub => try self.emit(.f64_sub),
+            .f64_mul => try self.emit(.f64_mul),
+            .f64_div => try self.emit(.f64_div),
+            .f64_min => try self.emit(.f64_min),
+            .f64_max => try self.emit(.f64_max),
+            .f64_copysign => try self.emit(.f64_copysign),
+            .i32_wrap_i64 => try self.emit(.i32_wrap_i64),
+            .i32_trunc_f32_s => try self.emit(.i32_trunc_f32_s),
+            .i32_trunc_f32_u => try self.emit(.i32_trunc_f32_u),
+            .i32_trunc_f64_s => try self.emit(.i32_trunc_f64_s),
+            .i32_trunc_f64_u => try self.emit(.i32_trunc_f64_u),
+            .i64_extend_i32_s => try self.emit(.i64_extend_i32_s),
+            .i64_extend_i32_u => try self.emit(.i64_extend_i32_u),
+            .i64_trunc_f32_s => try self.emit(.i64_trunc_f32_s),
+            .i64_trunc_f32_u => try self.emit(.i64_trunc_f32_u),
+            .i64_trunc_f64_s => try self.emit(.i64_trunc_f64_s),
+            .i64_trunc_f64_u => try self.emit(.i64_trunc_f64_u),
+            .f32_convert_i32_s => try self.emit(.f32_convert_i32_s),
+            .f32_convert_i32_u => try self.emit(.f32_convert_i32_u),
+            .f32_convert_i64_s => try self.emit(.f32_convert_i64_s),
+            .f32_convert_i64_u => try self.emit(.f32_convert_i64_u),
+            .f32_demote_f64 => try self.emit(.f32_demote_f64),
+            .f64_convert_i32_s => try self.emit(.f64_convert_i32_s),
+            .f64_convert_i32_u => try self.emit(.f64_convert_i32_u),
+            .f64_convert_i64_s => try self.emit(.f64_convert_i64_s),
+            .f64_convert_i64_u => try self.emit(.f64_convert_i64_u),
+            .f64_promote_f32 => try self.emit(.f64_promote_f32),
+            .i32_reinterpret_f32 => try self.emit(.i32_reinterpret_f32),
+            .i64_reinterpret_f64 => try self.emit(.i64_reinterpret_f64),
+            .f32_reinterpret_i32 => try self.emit(.f32_reinterpret_i32),
+            .f64_reinterpret_i64 => try self.emit(.f64_reinterpret_i64),
+            else => {
+                return error.UnhandledInstructionForLowering;
+            },
+        }
+    }
+};
 
 pub const Store = struct {
     allocator: Allocator,
@@ -433,7 +995,7 @@ pub const Store = struct {
             const start_func_addr = module_inst.func_addrs[start_func_idx_usize];
             var runtime = try Runtime.init(allocator, self, &module_inst);
             defer runtime.deinit();
-            const val = try runtime.invokeFunc(start_func_addr, &module_inst, &.{});
+            const val = try runtime.invokeFunc(start_func_addr, &module_inst);
 
             if (val != null) {
                 return error.StartFuncReturnedValue;
@@ -518,11 +1080,6 @@ pub const ExternVal = union(enum) {
     global: GlobalAddr,
 };
 
-const Label = struct {
-    arity: usize,
-    instr_start: usize,
-};
-
 const Frame = struct {
     base_ptr: usize,
     module: *const ModuleInstance,
@@ -549,26 +1106,25 @@ pub const Runtime = struct {
         self.stack.deinit(self.allocator);
     }
 
-    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr, module_inst: *const ModuleInstance, args: []Value) anyerror!?Value {
+    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr, module_inst: *const ModuleInstance) anyerror!?Value {
         const func_inst = self.store.funcs.items[func_addr];
         const func_type = func_inst.getType();
-        if (args.len != func_type.params.len) {
+
+        if (self.stack.items.len < func_type.params.len) {
             return error.InvalidArgumentCount;
         }
 
-        for (args, func_type.params) |arg, param_type| {
-            if (arg.getType() != param_type) {
+        const args_start = self.stack.items.len - func_type.params.len;
+
+        for (func_type.params, 0..) |param_type, i| {
+            if (self.stack.items[args_start + i].getType() != param_type) {
                 return error.InvalidArgumentType;
             }
         }
 
         switch (func_inst) {
             .wasm => |*wasm_func| {
-                const base_ptr = self.stack.items.len;
-
-                for (args) |arg| {
-                    try self.push(arg);
-                }
+                const base_ptr = args_start;
 
                 for (wasm_func.code.locals) |local_group| {
                     for (0..local_group.count) |_| {
@@ -591,7 +1147,12 @@ pub const Runtime = struct {
                 self.stack.shrinkRetainingCapacity(base_ptr);
                 return result;
             },
-            .host => |host_func| return host_func.code(args),
+            .host => |host_func| {
+                const args = self.stack.items[args_start..];
+                const res = try host_func.code(args);
+                self.stack.items.len = args_start;
+                return res;
+            },
         }
     }
 
@@ -661,11 +1222,11 @@ pub const Runtime = struct {
             .i64_const => |n| {
                 try self.push(.{ .i64 = n });
             },
-            .f32_const => |n| {
-                try self.push(.{ .f32 = n });
+            .f32_const => |x| {
+                try self.push(.{ .f32 = x });
             },
-            .f64_const => |n| {
-                try self.push(.{ .f64 = n });
+            .f64_const => |x| {
+                try self.push(.{ .f64 = x });
             },
             .local_get => |local_idx| {
                 const val = self.getLocal(frame, local_idx);
@@ -697,27 +1258,13 @@ pub const Runtime = struct {
             },
             .call => |func_idx| {
                 const func_idx_usize = @as(usize, func_idx);
-                std.debug.print("{any}", .{frame.module.func_addrs});
                 if (func_idx_usize >= frame.module.func_addrs.len) {
                     std.debug.print("Invalid function index: {any}\n", .{func_idx});
                     return error.InvalidFuncIndex;
                 }
 
                 const func_addr = frame.module.func_addrs[func_idx_usize];
-                const func_inst = self.store.funcs.items[func_addr];
-                const func_type = func_inst.getType();
-
-                if (self.stack.items.len < func_type.params.len) {
-                    return error.ValueStackUnderflow;
-                }
-
-                const call_args = try self.allocator.alloc(Value, func_type.params.len);
-                defer self.allocator.free(call_args);
-                for (call_args) |*v| {
-                    v.* = self.popUnsafe();
-                }
-
-                const res = try self.invokeFunc(func_addr, frame.module, call_args);
+                const res = try self.invokeFunc(func_addr, frame.module);
 
                 if (res) |val| {
                     try self.push(val);
