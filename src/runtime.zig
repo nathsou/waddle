@@ -340,7 +340,7 @@ pub const Store = struct {
         };
 
         var aux_frame = Frame{
-            .locals = &.{},
+            .base_ptr = 0,
             .module = &aux_module_inst,
         };
 
@@ -354,7 +354,7 @@ pub const Store = struct {
 
         const module_inst = try self.allocModule(allocator, module, extern_vals, global_init_vals);
         var frame = Frame{
-            .locals = &.{},
+            .base_ptr = 0,
             .module = &module_inst,
         };
 
@@ -524,7 +524,7 @@ const Label = struct {
 };
 
 const Frame = struct {
-    locals: []Value,
+    base_ptr: usize,
     module: *const ModuleInstance,
 };
 
@@ -551,11 +551,7 @@ pub const Runtime = struct {
 
     pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr, module_inst: *const ModuleInstance, args: []Value) anyerror!?Value {
         const func_inst = self.store.funcs.items[func_addr];
-        const func_type = switch (func_inst) {
-            .wasm => |wasm_func| wasm_func.type,
-            .host => |host_func| host_func.type,
-        };
-
+        const func_type = func_inst.getType();
         if (args.len != func_type.params.len) {
             return error.InvalidArgumentCount;
         }
@@ -568,32 +564,32 @@ pub const Runtime = struct {
 
         switch (func_inst) {
             .wasm => |*wasm_func| {
-                var func_runtime = try Runtime.init(self.allocator, self.store, module_inst);
-                defer func_runtime.deinit();
+                const base_ptr = self.stack.items.len;
+
+                for (args) |arg| {
+                    try self.push(arg);
+                }
+
+                for (wasm_func.code.locals) |local_group| {
+                    for (0..local_group.count) |_| {
+                        try self.push(local_group.type.defaultValue());
+                    }
+                }
 
                 var frame = Frame{
-                    .locals = try self.allocator.alloc(Value, wasm_func.code.locals.len + args.len),
+                    .base_ptr = base_ptr,
                     .module = module_inst,
                 };
 
-                defer self.allocator.free(frame.locals);
+                try self.execute(&frame, wasm_func.code);
 
-                // Initialise local variables
-                for (wasm_func.code.locals, 0..) |local, i| {
-                    frame.locals[args.len + i] = local.type.defaultValue();
-                }
-
-                for (args, 0..) |arg, i| {
-                    frame.locals[i] = arg;
-                }
-
-                try func_runtime.execute(&frame, wasm_func.code);
-
+                var result: ?Value = null;
                 if (wasm_func.type.results.len > 0) {
-                    return func_runtime.stack.items[func_runtime.stack.items.len - 1];
-                } else {
-                    return null;
+                    result = try self.pop();
                 }
+
+                self.stack.shrinkRetainingCapacity(base_ptr);
+                return result;
             },
             .host => |host_func| return host_func.code(args),
         }
@@ -607,12 +603,29 @@ pub const Runtime = struct {
         try self.push(.{ .i32 = if (b) 1 else 0 });
     }
 
-    fn pop(self: *Runtime) !Value {
-        if (self.stack.pop()) |val| {
-            return val;
-        } else {
+    fn popUnsafe(self: *Runtime) Value {
+        const val = self.stack.items[self.stack.items.len - 1];
+        self.stack.items.len -= 1;
+        return val;
+    }
+
+    fn popArgs(self: *Runtime, comptime n: usize) ![]Value {
+        if (self.stack.items.len < n) {
             return error.ValueStackUnderflow;
         }
+
+        const len = self.stack.items.len;
+        const slice = self.stack.items[len - n .. len];
+        self.stack.items.len -= n;
+        return slice;
+    }
+
+    fn pop(self: *Runtime) !Value {
+        if (self.stack.items.len == 0) {
+            return error.ValueStackUnderflow;
+        }
+
+        return self.popUnsafe();
     }
 
     fn peek(self: *Runtime) !Value {
@@ -621,6 +634,14 @@ pub const Runtime = struct {
         } else {
             return error.ValueStackUnderflow;
         }
+    }
+
+    fn getLocal(self: *Runtime, frame: *const Frame, idx: usize) Value {
+        return self.stack.items[frame.base_ptr + idx];
+    }
+
+    fn setLocal(self: *Runtime, frame: *const Frame, idx: usize, val: Value) void {
+        self.stack.items[frame.base_ptr + idx] = val;
     }
 
     fn step(self: *Runtime, instr: types.Instr, frame: *Frame) !void {
@@ -647,36 +668,32 @@ pub const Runtime = struct {
                 try self.push(.{ .f64 = n });
             },
             .local_get => |local_idx| {
-                const val = frame.locals[local_idx];
+                const val = self.getLocal(frame, local_idx);
                 try self.push(val);
             },
             .local_set => |local_idx| {
                 const val = try self.pop();
-                frame.locals[local_idx] = val;
+                self.setLocal(frame, local_idx, val);
             },
             .local_tee => |local_idx| {
                 const val = try self.peek();
-                try self.push(val);
-                frame.locals[local_idx] = val;
+                self.setLocal(frame, local_idx, val);
             },
             .i32_eqz => {
                 const val = try self.pop();
                 try self.pushBool(val.i32 == 0);
             },
             .i32_add => {
-                const b = try self.pop();
-                const a = try self.pop();
-                try self.push(.{ .i32 = a.i32 +% b.i32 });
+                const args = try self.popArgs(2);
+                try self.push(.{ .i32 = args[0].i32 +% args[1].i32 });
             },
             .i32_sub => {
-                const b = try self.pop();
-                const a = try self.pop();
-                try self.push(.{ .i32 = a.i32 -% b.i32 });
+                const args = try self.popArgs(2);
+                try self.push(.{ .i32 = args[0].i32 -% args[1].i32 });
             },
             .i32_mul => {
-                const b = try self.pop();
-                const a = try self.pop();
-                try self.push(.{ .i32 = a.i32 *% b.i32 });
+                const args = try self.popArgs(2);
+                try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
             },
             .call => |func_idx| {
                 const func_idx_usize = @as(usize, func_idx);
@@ -689,10 +706,15 @@ pub const Runtime = struct {
                 const func_addr = frame.module.func_addrs[func_idx_usize];
                 const func_inst = self.store.funcs.items[func_addr];
                 const func_type = func_inst.getType();
+
+                if (self.stack.items.len < func_type.params.len) {
+                    return error.ValueStackUnderflow;
+                }
+
                 const call_args = try self.allocator.alloc(Value, func_type.params.len);
                 defer self.allocator.free(call_args);
                 for (call_args) |*v| {
-                    v.* = try self.pop();
+                    v.* = self.popUnsafe();
                 }
 
                 const res = try self.invokeFunc(func_addr, frame.module, call_args);
