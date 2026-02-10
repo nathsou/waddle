@@ -17,8 +17,9 @@ pub const FlatInstr = union(enum) {
     br: PC,
     br_if: PC,
     br_table: struct { label_indices: []PC, default_idx: PC },
-    @"return",
-    call: PC,
+    @"return": usize, // number of values to return
+    call: struct { entry_pc: PC, arguments: usize },
+    call_host: *const HostFunc,
 
     // Parametric instructions
     drop,
@@ -209,15 +210,26 @@ pub const FuncLabel = struct {
     }
 };
 
+pub const Bytecode = struct {
+    instrs: []FlatInstr,
+    functions: []?PC, // store function index -> entry program counter
+
+    pub fn deinit(self: *Bytecode, allocator: Allocator) void {
+        allocator.free(self.instrs);
+        allocator.free(self.functions);
+    }
+};
+
 pub const BytecodeLowering = struct {
     allocator: Allocator,
     instrs: ArrayList(FlatInstr),
     block_labels: ArrayList(BlockLabel),
     func_labels: []FuncLabel,
     flat: ArrayList(FlatInstr),
+    store: *Store,
 
-    pub fn init(allocator: Allocator, function_count: usize) !BytecodeLowering {
-        const func_labels = try allocator.alloc(FuncLabel, function_count);
+    pub fn init(allocator: Allocator, store: *Store) !BytecodeLowering {
+        const func_labels = try allocator.alloc(FuncLabel, store.funcs.items.len);
 
         for (func_labels) |*label| {
             label.* = FuncLabel{
@@ -232,6 +244,7 @@ pub const BytecodeLowering = struct {
             .block_labels = .empty,
             .func_labels = func_labels,
             .flat = .empty,
+            .store = store,
         };
     }
 
@@ -257,17 +270,24 @@ pub const BytecodeLowering = struct {
         try self.flat.append(self.allocator, instr);
     }
 
-    pub fn lowerStore(self: *BytecodeLowering, store: *Store) !void {
-        for (store.funcs.items, 0..) |func, i| {
-            try self.lowerFunc(func.wasm.code, i);
+    pub fn lower(self: *BytecodeLowering) !Bytecode {
+        for (self.store.funcs.items, 0..) |func, i| {
+            switch (func) {
+                .wasm => |wasm_func| {
+                    try self.lowerFunc(wasm_func.type, &wasm_func.code, i);
+                },
+                .host => {
+                    return error.UnsupportedFuncTypeForLowering;
+                },
+            }
         }
 
         // Patch call instructions with actual function addresses
         for (self.func_labels) |func_label| {
             for (func_label.calls_to_patch.items) |call_idx| {
                 switch (self.flat.items[call_idx]) {
-                    .call => |*pc| {
-                        pc.* = func_label.entry;
+                    .call => |*arg| {
+                        arg.*.entry_pc = func_label.entry;
                     },
                     else => {
                         return error.InvalidCallInstructionForPatching;
@@ -275,27 +295,56 @@ pub const BytecodeLowering = struct {
                 }
             }
         }
-    }
 
-    fn lowerFunc(self: *BytecodeLowering, func: types.Func, func_index: usize) !void {
-        // record the start of the function
-        self.func_labels[func_index].entry = self.flat.items.len;
+        var function_pc_mapping = try self.allocator.alloc(?PC, self.store.funcs.items.len);
+        @memset(function_pc_mapping, null);
 
-        for (func.body) |instr| {
-            try self.lower(instr);
+        for (self.func_labels, 0..) |func_label, i| {
+            function_pc_mapping[i] = func_label.entry;
         }
 
-        try self.emit(.@"return");
+        const instrs = try self.flat.toOwnedSlice(self.allocator);
+
+        return Bytecode{
+            .instrs = instrs,
+            .functions = function_pc_mapping,
+        };
     }
 
-    fn patchBranches(self: *BytecodeLowering, label: BlockLabel) !void {
+    fn lowerFunc(self: *BytecodeLowering, type_: types.FuncType, func: *const types.Func, func_index: usize) !void {
+        // record the start of the function
+        var label = &self.func_labels[func_index];
+        label.entry = self.flat.items.len;
+
+        // Emit instructions to initialize local variables with default values
+        // Note: parameters are already on the stack, pushed by caller
+        for (func.locals) |local_group| {
+            for (0..local_group.count) |_| {
+                // Emit const instruction to push default value
+                switch (local_group.type) {
+                    .i32 => try self.emit(.{ .i32_const = 0 }),
+                    .i64 => try self.emit(.{ .i64_const = 0 }),
+                    .f32 => try self.emit(.{ .f32_const = 0.0 }),
+                    .f64 => try self.emit(.{ .f64_const = 0.0 }),
+                }
+            }
+        }
+
+        for (func.body) |instr| {
+            try self.lowerInstr(instr);
+        }
+
+        try self.emit(.{ .@"return" = type_.results.len });
+    }
+
+    fn patchBranches(self: *BytecodeLowering, label: *const BlockLabel) !void {
         for (label.branches_to_patch.items) |branch_idx| {
             switch (self.flat.items[branch_idx]) {
                 .br => |*pc| {
-                    pc.* = label.start;
+                    pc.* = label.end;
                 },
                 .br_if => |*pc| {
-                    pc.* = label.start;
+                    pc.* = label.end;
                 },
                 else => {
                     return error.InvalidBranchInstructionForPatching;
@@ -304,7 +353,7 @@ pub const BytecodeLowering = struct {
         }
     }
 
-    fn lower(self: *BytecodeLowering, instr: types.Instr) !void {
+    fn lowerInstr(self: *BytecodeLowering, instr: types.Instr) !void {
         switch (instr) {
             .@"unreachable" => try self.emit(.@"unreachable"),
             .nop => try self.emit(.nop),
@@ -315,17 +364,17 @@ pub const BytecodeLowering = struct {
                     else => unreachable,
                 };
 
-                var label = BlockLabel{
+                try self.block_labels.append(self.allocator, BlockLabel{
                     .kind = label_kind,
                     .start = self.flat.items.len,
                     .end = 0, // To be patched
                     .branches_to_patch = .empty,
-                };
+                });
 
-                try self.block_labels.append(self.allocator, label);
+                var label = &self.block_labels.items[self.block_labels.items.len - 1];
 
                 for (block.instructions) |block_instr| {
-                    try self.lower(block_instr);
+                    try self.lowerInstr(block_instr);
                 }
 
                 if (label_kind == .block) {
@@ -333,25 +382,26 @@ pub const BytecodeLowering = struct {
                     try self.patchBranches(label);
                 }
 
+                label.deinit(self.allocator);
                 self.block_labels.items.len -= 1; // Pop the label
             },
             .@"if" => |if_| {
-                var exit_label = BlockLabel{
+                try self.block_labels.append(self.allocator, BlockLabel{
                     .kind = .@"if",
                     .start = self.flat.items.len,
                     .end = 0, // To be patched
                     .branches_to_patch = .empty,
-                };
-                defer exit_label.deinit(self.allocator);
+                });
+
+                var exit_label = &self.block_labels.items[self.block_labels.items.len - 1];
 
                 // negate condition to skip then block if false
                 try self.emit(.i32_eqz);
                 const else_jump_idx = self.flat.items.len;
                 try self.emit(.{ .br_if = 0 }); // Placeholder for branch to else block
-                try self.block_labels.append(self.allocator, exit_label);
 
                 for (if_.then_instructions) |then_instr| {
-                    try self.lower(then_instr);
+                    try self.lowerInstr(then_instr);
                 }
 
                 // Unconditionally jump to end of if after then block
@@ -360,11 +410,13 @@ pub const BytecodeLowering = struct {
                 self.flat.items[else_jump_idx] = .{ .br_if = self.flat.items.len }; // Patch branch to else block
 
                 for (if_.else_instructions) |else_instr| {
-                    try self.lower(else_instr);
+                    try self.lowerInstr(else_instr);
                 }
 
                 exit_label.end = self.flat.items.len;
                 try self.patchBranches(exit_label);
+                exit_label.deinit(self.allocator);
+                self.block_labels.items.len -= 1; // Pop the label
             },
             .br, .br_if => |label_idx| {
                 if (self.block_labels.items.len <= label_idx) {
@@ -396,9 +448,18 @@ pub const BytecodeLowering = struct {
             },
             .call => |func_idx| {
                 const call_instr_idx = self.flat.items.len;
-                try self.emit(.{ .call = 0 }); // placeholder
-                std.debug.assert(func_idx < self.func_labels.len);
-                try self.func_labels[func_idx].calls_to_patch.append(self.allocator, call_instr_idx);
+                const func_inst = self.store.funcs.items[func_idx];
+
+                switch (func_inst) {
+                    .wasm => |wasm_func| {
+                        try self.emit(.{ .call = .{ .entry_pc = 0, .arguments = wasm_func.type.params.len } });
+                        std.debug.assert(func_idx < self.func_labels.len);
+                        try self.func_labels[func_idx].calls_to_patch.append(self.allocator, call_instr_idx);
+                    },
+                    .host => |*host_func| {
+                        try self.emit(.{ .call_host = host_func });
+                    },
+                }
             },
             .drop => try self.emit(.drop),
             .select => try self.emit(.select),
@@ -815,7 +876,7 @@ pub const Store = struct {
         return module_inst;
     }
 
-    fn evalConstExpr(self: *Store, frame: *Frame, expr: types.Expr) !Value {
+    fn evalConstExpr(self: *Store, global_addrs: []GlobalAddr, expr: types.Expr) !Value {
         if (expr.len != 1) {
             return error.InvalidConstExpr;
         }
@@ -827,10 +888,10 @@ pub const Store = struct {
             .f64_const => |val| return .{ .f64 = val },
             .global_get => |global_idx| {
                 const global_idx_usize = @as(usize, global_idx);
-                if (global_idx_usize >= frame.module.global_addrs.len) {
+                if (global_idx_usize >= global_addrs.len) {
                     return error.InvalidGlobalIndex;
                 }
-                const global_addr = frame.module.global_addrs[global_idx_usize];
+                const global_addr = global_addrs[global_idx_usize];
                 const global_inst = self.globals.items[global_addr];
                 return global_inst.value;
             },
@@ -892,37 +953,19 @@ pub const Store = struct {
             }
         }
 
-        var aux_module_inst = ModuleInstance{
-            .types = &.{},
-            .func_addrs = &.{},
-            .table_addrs = &.{},
-            .mem_addrs = &.{},
-            .global_addrs = global_extern_vals,
-            .exports = &.{},
-        };
-
-        var aux_frame = Frame{
-            .base_ptr = 0,
-            .module = &aux_module_inst,
-        };
-
         const global_init_vals = try allocator.alloc(Value, module.globals.len);
         defer allocator.free(global_init_vals);
 
         for (module.globals, 0..) |global, i| {
-            const val = try self.evalConstExpr(&aux_frame, global.init);
+            const val = try self.evalConstExpr(global_extern_vals, global.init);
             global_init_vals[i] = val;
         }
 
         const module_inst = try self.allocModule(allocator, module, extern_vals, global_init_vals);
-        var frame = Frame{
-            .base_ptr = 0,
-            .module = &module_inst,
-        };
 
         // Initalise element segments
         for (module.elements) |elem| {
-            const offset_val = try self.evalConstExpr(&frame, elem.offset);
+            const offset_val = try self.evalConstExpr(global_extern_vals, elem.offset);
             const offset = switch (offset_val) {
                 .i32 => |n| blk: {
                     if (n < 0) {
@@ -958,7 +1001,7 @@ pub const Store = struct {
 
         // Initialise data segments
         for (module.data) |data| {
-            const offset_val = try self.evalConstExpr(&frame, data.offset);
+            const offset_val = try self.evalConstExpr(global_extern_vals, data.offset);
             const offset = switch (offset_val) {
                 .i32 => |n| blk: {
                     if (n < 0) {
@@ -983,22 +1026,6 @@ pub const Store = struct {
 
             for (data.init, 0..) |byte, i| {
                 mem_inst.data[offset + i] = byte;
-            }
-        }
-
-        if (module.start) |start_func_idx| {
-            const start_func_idx_usize = @as(usize, start_func_idx);
-            if (start_func_idx_usize >= module_inst.func_addrs.len) {
-                return error.InvalidStartFuncIndex;
-            }
-
-            const start_func_addr = module_inst.func_addrs[start_func_idx_usize];
-            var runtime = try Runtime.init(allocator, self, &module_inst);
-            defer runtime.deinit();
-            const val = try runtime.invokeFunc(start_func_addr, &module_inst);
-
-            if (val != null) {
-                return error.StartFuncReturnedValue;
             }
         }
 
@@ -1029,17 +1056,17 @@ pub const ModuleInstance = struct {
     }
 };
 
-const HostFunc = *const fn ([]Value) anyerror!?Value;
+const HostFunc = struct {
+    type: types.FuncType,
+    code: *const fn ([]Value) anyerror!?Value,
+};
 
 const FuncInstance = union(enum) {
     wasm: struct {
         type: types.FuncType,
         code: types.Func,
     },
-    host: struct {
-        type: types.FuncType,
-        code: HostFunc,
-    },
+    host: HostFunc,
 
     pub fn getType(self: FuncInstance) types.FuncType {
         return switch (self) {
@@ -1082,31 +1109,64 @@ pub const ExternVal = union(enum) {
 
 const Frame = struct {
     base_ptr: usize,
-    module: *const ModuleInstance,
+    return_pc: ?usize,
 };
 
 const initial_stack_capacity: usize = 256;
+const initial_call_stack_capacity: usize = 256;
 
 pub const Runtime = struct {
     allocator: Allocator,
     store: *Store,
-    module: *const ModuleInstance,
+    bytecode: Bytecode,
     stack: ArrayList(Value),
+    call_stack: ArrayList(Frame),
 
-    pub fn init(allocator: Allocator, store: *Store, module_inst: *const ModuleInstance) !Runtime {
+    pub fn init(allocator: Allocator, store: *Store) !Runtime {
+        var lowering = try BytecodeLowering.init(allocator, store);
+        defer lowering.deinit();
+
         return Runtime{
             .allocator = allocator,
             .store = store,
-            .module = module_inst,
+            .bytecode = try lowering.lower(),
             .stack = try ArrayList(Value).initCapacity(allocator, initial_stack_capacity),
+            .call_stack = try ArrayList(Frame).initCapacity(allocator, initial_call_stack_capacity),
         };
     }
 
     pub fn deinit(self: *Runtime) void {
         self.stack.deinit(self.allocator);
+        self.bytecode.deinit(self.allocator);
+        self.call_stack.deinit(self.allocator);
     }
 
-    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr, module_inst: *const ModuleInstance) anyerror!?Value {
+    pub fn invokeStartFunc(self: *Runtime, module_inst: *const ModuleInstance, start_func_index: ?u32) !void {
+        if (start_func_index) |idx| {
+            const start_func_idx_usize = @as(usize, idx);
+            if (start_func_idx_usize >= module_inst.func_addrs.len) {
+                return error.InvalidStartFuncIndex;
+            }
+
+            const start_func_addr = module_inst.func_addrs[start_func_idx_usize];
+            _ = try self.invokeFunc(start_func_addr);
+        }
+    }
+
+    pub fn invokeExportedFunc(self: *Runtime, module_inst: *const ModuleInstance, export_name: types.Name) !?Value {
+        for (module_inst.exports) |exp| {
+            if (std.mem.eql(u8, exp.name, export_name)) {
+                return switch (exp.value) {
+                    .func => |func_addr| try self.invokeFunc(func_addr),
+                    else => error.ExportNotAFunction,
+                };
+            }
+        }
+
+        return error.ExportNotFound;
+    }
+
+    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr) !?Value {
         const func_inst = self.store.funcs.items[func_addr];
         const func_type = func_inst.getType();
 
@@ -1126,26 +1186,25 @@ pub const Runtime = struct {
             .wasm => |*wasm_func| {
                 const base_ptr = args_start;
 
-                for (wasm_func.code.locals) |local_group| {
-                    for (0..local_group.count) |_| {
-                        try self.push(local_group.type.defaultValue());
-                    }
-                }
-
-                var frame = Frame{
+                // Locals are initialized by bytecode instructions emitted during lowering
+                // Parameters are already on the stack at base_ptr
+                try self.call_stack.append(self.allocator, Frame{
                     .base_ptr = base_ptr,
-                    .module = module_inst,
-                };
+                    .return_pc = null,
+                });
 
-                try self.execute(&frame, wasm_func.code);
+                if (self.bytecode.functions[func_addr]) |entry_pc| {
+                    try self.execute(entry_pc);
+                    var result: ?Value = null;
+                    if (wasm_func.type.results.len > 0) {
+                        result = try self.pop();
+                    }
 
-                var result: ?Value = null;
-                if (wasm_func.type.results.len > 0) {
-                    result = try self.pop();
+                    self.stack.shrinkRetainingCapacity(base_ptr);
+                    return result;
+                } else {
+                    return error.FunctionNotFound;
                 }
-
-                self.stack.shrinkRetainingCapacity(base_ptr);
-                return result;
             },
             .host => |host_func| {
                 const args = self.stack.items[args_start..];
@@ -1197,101 +1256,138 @@ pub const Runtime = struct {
         }
     }
 
-    fn getLocal(self: *Runtime, frame: *const Frame, idx: usize) Value {
+    fn getCurrentFrame(self: *Runtime) !*Frame {
+        if (self.call_stack.items.len == 0) {
+            return error.CallStackUnderflow;
+        }
+
+        return &self.call_stack.items[self.call_stack.items.len - 1];
+    }
+
+    fn getLocal(self: *Runtime, idx: usize) !Value {
+        const frame = try self.getCurrentFrame();
         return self.stack.items[frame.base_ptr + idx];
     }
 
-    fn setLocal(self: *Runtime, frame: *const Frame, idx: usize, val: Value) void {
+    fn setLocal(self: *Runtime, idx: usize, val: Value) !void {
+        const frame = try self.getCurrentFrame();
         self.stack.items[frame.base_ptr + idx] = val;
     }
 
-    fn step(self: *Runtime, instr: types.Instr, frame: *Frame) !void {
-        std.debug.print("{any} {any}\n", .{ instr, self.stack.items });
+    pub fn execute(self: *Runtime, start_pc: usize) !void {
+        var pc = start_pc;
 
-        switch (instr) {
-            .@"unreachable" => {
-                return error.Unreachable;
-            },
-            .nop => {},
-            .drop => {
-                _ = try self.pop();
-            },
-            .i32_const => |n| {
-                try self.push(.{ .i32 = n });
-            },
-            .i64_const => |n| {
-                try self.push(.{ .i64 = n });
-            },
-            .f32_const => |x| {
-                try self.push(.{ .f32 = x });
-            },
-            .f64_const => |x| {
-                try self.push(.{ .f64 = x });
-            },
-            .local_get => |local_idx| {
-                const val = self.getLocal(frame, local_idx);
-                try self.push(val);
-            },
-            .local_set => |local_idx| {
-                const val = try self.pop();
-                self.setLocal(frame, local_idx, val);
-            },
-            .local_tee => |local_idx| {
-                const val = try self.peek();
-                self.setLocal(frame, local_idx, val);
-            },
-            .i32_eqz => {
-                const val = try self.pop();
-                try self.pushBool(val.i32 == 0);
-            },
-            .i32_add => {
-                const args = try self.popArgs(2);
-                try self.push(.{ .i32 = args[0].i32 +% args[1].i32 });
-            },
-            .i32_sub => {
-                const args = try self.popArgs(2);
-                try self.push(.{ .i32 = args[0].i32 -% args[1].i32 });
-            },
-            .i32_mul => {
-                const args = try self.popArgs(2);
-                try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
-            },
-            .call => |func_idx| {
-                const func_idx_usize = @as(usize, func_idx);
-                if (func_idx_usize >= frame.module.func_addrs.len) {
-                    std.debug.print("Invalid function index: {any}\n", .{func_idx});
-                    return error.InvalidFuncIndex;
-                }
+        while (pc < self.bytecode.instrs.len) {
+            const instr = self.bytecode.instrs[pc];
+            std.debug.print("{any} {any}\n", .{ instr, self.stack.items });
 
-                const func_addr = frame.module.func_addrs[func_idx_usize];
-                const res = try self.invokeFunc(func_addr, frame.module);
-
-                if (res) |val| {
+            switch (instr) {
+                .@"unreachable" => {
+                    return error.Unreachable;
+                },
+                .nop => {
+                    pc += 1;
+                },
+                .drop => {
+                    _ = try self.pop();
+                    pc += 1;
+                },
+                .i32_const => |n| {
+                    try self.push(.{ .i32 = n });
+                    pc += 1;
+                },
+                .i64_const => |n| {
+                    try self.push(.{ .i64 = n });
+                    pc += 1;
+                },
+                .f32_const => |x| {
+                    try self.push(.{ .f32 = x });
+                    pc += 1;
+                },
+                .f64_const => |x| {
+                    try self.push(.{ .f64 = x });
+                    pc += 1;
+                },
+                .local_get => |local_idx| {
+                    const val = try self.getLocal(local_idx);
                     try self.push(val);
-                }
-            },
-            .@"if" => |s| {
-                const cond = try self.pop();
-                const instructions = switch (cond.i32) {
-                    0 => s.else_instructions,
-                    else => s.then_instructions,
-                };
+                    pc += 1;
+                },
+                .local_set => |local_idx| {
+                    const val = try self.pop();
+                    try self.setLocal(local_idx, val);
+                    pc += 1;
+                },
+                .local_tee => |local_idx| {
+                    const val = try self.peek();
+                    try self.setLocal(local_idx, val);
+                    pc += 1;
+                },
+                .i32_eqz => {
+                    const val = try self.pop();
+                    try self.pushBool(val.i32 == 0);
+                    pc += 1;
+                },
+                .i32_add => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 +% args[1].i32 });
+                    pc += 1;
+                },
+                .i32_sub => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 -% args[1].i32 });
+                    pc += 1;
+                },
+                .i32_mul => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
+                    pc += 1;
+                },
+                .call => |call| {
+                    try self.call_stack.append(self.allocator, Frame{
+                        .base_ptr = self.stack.items.len - call.arguments,
+                        .return_pc = pc + 1,
+                    });
 
-                for (instructions) |inst| {
-                    try self.step(inst, frame);
-                }
-            },
-            else => {
-                // For now, just print the instruction and return an error
-                std.debug.print("Unsupported instruction: {any}\n", .{instr});
-                return error.UnsupportedInstruction;
-            },
-        }
-    }
+                    pc = call.entry_pc;
+                },
+                .@"return" => |arity| {
+                    const frame = try self.getCurrentFrame();
 
-    pub fn execute(self: *Runtime, frame: *Frame, func: types.Func) !void {
-        for (func.body) |instr| {
-            try self.step(instr, frame);
+                    if (frame.return_pc) |return_pc| {
+                        // Keep return values, drop locals for this frame
+                        if (arity == 0) {
+                            self.stack.items.len = frame.base_ptr;
+                        } else {
+                            const len = self.stack.items.len;
+                            const results_start = len - arity;
+                            @memmove(self.stack.items[frame.base_ptr .. frame.base_ptr + arity], self.stack.items[results_start..len]);
+                            self.stack.items.len = frame.base_ptr + arity;
+                        }
+
+                        pc = return_pc;
+                        self.call_stack.items.len -= 1;
+                    } else {
+                        return; // end execution
+                    }
+                },
+                .br => |target_pc| {
+                    pc = target_pc;
+                },
+                .br_if => |target_pc| {
+                    const condition = try self.pop();
+
+                    if (condition.i32 != 0) {
+                        pc = target_pc;
+                    } else {
+                        pc += 1;
+                    }
+                },
+                else => {
+                    std.debug.print("Unsupported instruction: {any}\n", .{instr});
+                    return error.UnsupportedInstruction;
+                },
+            }
         }
     }
 };

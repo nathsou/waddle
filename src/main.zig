@@ -15,15 +15,14 @@ pub fn main() !void {
     var store = runtime.Store.init(allocator);
     defer store.deinit();
     const module = try parser.readModule();
-    _ = try store.instantiate(arena.allocator(), module, &.{});
-    std.debug.print("{any}\n", .{store.funcs.items[0].wasm.code.body});
+    var module_inst = try store.instantiate(allocator, module, &.{});
+    defer module_inst.deinit(allocator);
 
-    var lowering = try runtime.BytecodeLowering.init(allocator, store.funcs.items.len);
-    defer lowering.deinit();
-    try lowering.lowerStore(&store);
+    var vm = try runtime.Runtime.init(allocator, &store);
+    defer vm.deinit();
 
-    std.debug.print("Lowered bytecode:\n", .{});
-    for (lowering.flat.items) |instr| {
-        std.debug.print("{any}\n", .{instr});
+    const result = try vm.invokeExportedFunc(&module_inst, "main");
+    if (result) |res| {
+        std.debug.print("{any}\n", .{res});
     }
 }
