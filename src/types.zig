@@ -69,6 +69,10 @@ pub const BlockType = union(enum) {
 pub const FuncType = struct {
     params: []ValType,
     results: []ValType,
+
+    pub fn eql(self: FuncType, other: FuncType) bool {
+        return std.mem.eql(ValType, self.params, other.params) and std.mem.eql(ValType, self.results, other.results);
+    }
 };
 
 pub const Limits = struct {

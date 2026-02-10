@@ -16,6 +16,11 @@ const MemArg = struct {
     mem: *const MemoryInstance,
 };
 
+const CallIndirectArg = struct {
+    func_type: types.FuncType,
+    table: *const TableInstance,
+};
+
 pub const FlatInstr = union(enum) {
     // Control instructions
     @"unreachable",
@@ -25,6 +30,7 @@ pub const FlatInstr = union(enum) {
     br_table: struct { label_indices: []PC, default_idx: PC },
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
+    call_indirect: CallIndirectArg,
     call_host: *const HostFunc,
 
     // Parametric instructions
@@ -35,8 +41,8 @@ pub const FlatInstr = union(enum) {
     local_get: LocalIndex,
     local_set: LocalIndex,
     local_tee: LocalIndex,
-    global_get: GlobalAddr,
-    global_set: GlobalAddr,
+    global_get: *const GlobalInstance,
+    global_set: *GlobalInstance,
 
     // Memory instructions
     i32_load: MemArg,
@@ -218,7 +224,7 @@ pub const FuncLabel = struct {
 
 pub const Bytecode = struct {
     instrs: []FlatInstr,
-    functions: []?PC, // store function index -> entry program counter
+    functions: []?PC, // store function addr -> entry program counter
 
     pub fn deinit(self: *Bytecode, allocator: Allocator) void {
         allocator.free(self.instrs);
@@ -483,6 +489,16 @@ const BytecodeLowering = struct {
                     },
                 }
             },
+            .call_indirect => |arg| {
+                std.debug.assert(self.current_func != null);
+                std.debug.assert(self.current_func.?.module.table_addrs.len > arg.table_idx);
+                const module_inst = self.current_func.?.module;
+                const table_addr = module_inst.table_addrs[arg.table_idx];
+                const table_inst = &self.store.tables.items[table_addr];
+                std.debug.assert(module_inst.types.len > arg.type_idx);
+                const func_type = module_inst.types[arg.type_idx];
+                try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table = table_inst } });
+            },
             .@"return" => {
                 if (self.current_func) |f| {
                     try self.emit(.{ .@"return" = f.type.results.len });
@@ -498,9 +514,11 @@ const BytecodeLowering = struct {
             .global_get, .global_set => |idx| {
                 std.debug.assert(self.current_func.?.module.global_addrs.len > idx);
                 const global_addr = self.current_func.?.module.global_addrs[idx];
+                const global_inst = &self.store.globals.items[global_addr];
+
                 switch (instr) {
-                    .global_get => try self.emit(.{ .global_get = global_addr }),
-                    else => try self.emit(.{ .global_set = global_addr }),
+                    .global_get => try self.emit(.{ .global_get = global_inst }),
+                    else => try self.emit(.{ .global_set = global_inst }),
                 }
             },
             .i32_load => |arg| try self.emit(.{ .i32_load = self.memArg(arg) }),
@@ -1385,6 +1403,34 @@ pub const Runtime = struct {
 
                     pc = call.entry_pc;
                 },
+                .call_indirect => |call| {
+                    const i: usize = @intCast(self.pop().i32);
+
+                    if (i >= call.table.elem.len) {
+                        return error.InvalidIndirectCallIndex;
+                    }
+
+                    if (call.table.elem[i]) |func_addr| {
+                        const func_inst = self.store.funcs.items[func_addr];
+
+                        if (!func_inst.getType().eql(call.func_type)) {
+                            return error.IndirectCallTypeMismatch;
+                        }
+
+                        if (self.bytecode.functions[func_addr]) |entry_pc| {
+                            try self.call_stack.append(self.allocator, Frame{
+                                .base_ptr = self.stack.items.len - call.func_type.params.len,
+                                .return_pc = pc + 1,
+                            });
+
+                            pc = entry_pc;
+                        } else {
+                            return error.FunctionNotFound;
+                        }
+                    } else {
+                        return error.UninitializedTableElement;
+                    }
+                },
                 .@"return" => |arity| {
                     const frame = try self.getCurrentFrame();
 
@@ -1442,14 +1488,12 @@ pub const Runtime = struct {
                     try self.setLocal(local_idx, val);
                     pc += 1;
                 },
-                .global_get => |global_addr| {
-                    const global_inst = self.store.globals.items[global_addr];
+                .global_get => |global_inst| {
                     try self.push(global_inst.value);
                     pc += 1;
                 },
-                .global_set => |global_addr| {
+                .global_set => |global_inst| {
                     const val = self.pop();
-                    var global_inst = self.store.globals.items[global_addr];
                     std.debug.assert(global_inst.mutable);
                     global_inst.value = val;
                     pc += 1;
