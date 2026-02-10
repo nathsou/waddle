@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const parse = @import("parse.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const Value = types.Value;
@@ -220,15 +221,16 @@ pub const Bytecode = struct {
     }
 };
 
-pub const BytecodeLowering = struct {
+const BytecodeLowering = struct {
     allocator: Allocator,
     instrs: ArrayList(FlatInstr),
     block_labels: ArrayList(BlockLabel),
     func_labels: []FuncLabel,
     flat: ArrayList(FlatInstr),
-    store: *Store,
+    store: *const Store,
+    current_func_type: ?types.FuncType,
 
-    pub fn init(allocator: Allocator, store: *Store) !BytecodeLowering {
+    pub fn init(allocator: Allocator, store: *const Store) !BytecodeLowering {
         const func_labels = try allocator.alloc(FuncLabel, store.funcs.items.len);
 
         for (func_labels) |*label| {
@@ -245,6 +247,7 @@ pub const BytecodeLowering = struct {
             .func_labels = func_labels,
             .flat = .empty,
             .store = store,
+            .current_func_type = null,
         };
     }
 
@@ -315,6 +318,8 @@ pub const BytecodeLowering = struct {
         // record the start of the function
         var label = &self.func_labels[func_index];
         label.entry = self.flat.items.len;
+        self.current_func_type = type_;
+        defer self.current_func_type = null;
 
         // Emit instructions to initialize local variables with default values
         // Note: parameters are already on the stack, pushed by caller
@@ -371,18 +376,19 @@ pub const BytecodeLowering = struct {
                     .branches_to_patch = .empty,
                 });
 
-                var label = &self.block_labels.items[self.block_labels.items.len - 1];
+                const label_idx = self.block_labels.items.len - 1;
 
                 for (block.instructions) |block_instr| {
                     try self.lowerInstr(block_instr);
                 }
 
                 if (label_kind == .block) {
+                    var label = &self.block_labels.items[label_idx];
                     label.end = self.flat.items.len;
                     try self.patchBranches(label);
                 }
 
-                label.deinit(self.allocator);
+                self.block_labels.items[label_idx].deinit(self.allocator);
                 self.block_labels.items.len -= 1; // Pop the label
             },
             .@"if" => |if_| {
@@ -393,7 +399,7 @@ pub const BytecodeLowering = struct {
                     .branches_to_patch = .empty,
                 });
 
-                var exit_label = &self.block_labels.items[self.block_labels.items.len - 1];
+                const exit_label_idx = self.block_labels.items.len - 1;
 
                 // negate condition to skip then block if false
                 try self.emit(.i32_eqz);
@@ -405,7 +411,7 @@ pub const BytecodeLowering = struct {
                 }
 
                 // Unconditionally jump to end of if after then block
-                try exit_label.branches_to_patch.append(self.allocator, self.flat.items.len);
+                try self.block_labels.items[exit_label_idx].branches_to_patch.append(self.allocator, self.flat.items.len);
                 try self.emit(.{ .br = 0 });
                 self.flat.items[else_jump_idx] = .{ .br_if = self.flat.items.len }; // Patch branch to else block
 
@@ -413,6 +419,7 @@ pub const BytecodeLowering = struct {
                     try self.lowerInstr(else_instr);
                 }
 
+                var exit_label = &self.block_labels.items[exit_label_idx];
                 exit_label.end = self.flat.items.len;
                 try self.patchBranches(exit_label);
                 exit_label.deinit(self.allocator);
@@ -459,6 +466,13 @@ pub const BytecodeLowering = struct {
                     .host => |*host_func| {
                         try self.emit(.{ .call_host = host_func });
                     },
+                }
+            },
+            .@"return" => {
+                if (self.current_func_type) |ty| {
+                    try self.emit(.{ .@"return" = ty.results.len });
+                } else {
+                    return error.ReturnInstructionOutsideOfFunction;
                 }
             },
             .drop => try self.emit(.drop),
@@ -621,6 +635,7 @@ pub const BytecodeLowering = struct {
             .f32_reinterpret_i32 => try self.emit(.f32_reinterpret_i32),
             .f64_reinterpret_i64 => try self.emit(.f64_reinterpret_i64),
             else => {
+                std.debug.print("{any}\n", .{instr});
                 return error.UnhandledInstructionForLowering;
             },
         }
@@ -1117,13 +1132,15 @@ const initial_call_stack_capacity: usize = 256;
 
 pub const Runtime = struct {
     allocator: Allocator,
-    store: *Store,
+    store: Store,
     bytecode: Bytecode,
     stack: ArrayList(Value),
     call_stack: ArrayList(Frame),
+    module: ModuleInstance,
+    start_func_addr: ?FuncAddr,
 
-    pub fn init(allocator: Allocator, store: *Store) !Runtime {
-        var lowering = try BytecodeLowering.init(allocator, store);
+    pub fn init(allocator: Allocator, store: Store, module: ModuleInstance, start_func_addr: ?FuncAddr) !Runtime {
+        var lowering = try BytecodeLowering.init(allocator, &store);
         defer lowering.deinit();
 
         return Runtime{
@@ -1132,6 +1149,8 @@ pub const Runtime = struct {
             .bytecode = try lowering.lower(),
             .stack = try ArrayList(Value).initCapacity(allocator, initial_stack_capacity),
             .call_stack = try ArrayList(Frame).initCapacity(allocator, initial_call_stack_capacity),
+            .start_func_addr = start_func_addr,
+            .module = module,
         };
     }
 
@@ -1139,22 +1158,42 @@ pub const Runtime = struct {
         self.stack.deinit(self.allocator);
         self.bytecode.deinit(self.allocator);
         self.call_stack.deinit(self.allocator);
+        self.module.deinit(self.allocator);
+        self.store.deinit();
     }
 
-    pub fn invokeStartFunc(self: *Runtime, module_inst: *const ModuleInstance, start_func_index: ?u32) !void {
-        if (start_func_index) |idx| {
-            const start_func_idx_usize = @as(usize, idx);
+    pub fn from(allocator: Allocator, module_path: []const u8) !Runtime {
+        var store = Store.init(allocator);
+
+        const file = try std.fs.cwd().openFile(module_path, .{});
+        defer file.close();
+        const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+        var parser = parse.Parser.init(allocator, bytes);
+        const module = try parser.readModule();
+        const module_inst = try store.instantiate(allocator, module, &.{});
+
+        var start_func_addr: ?FuncAddr = null;
+        if (module.start) |start_func_idx| {
+            const start_func_idx_usize = @as(usize, start_func_idx);
+
             if (start_func_idx_usize >= module_inst.func_addrs.len) {
                 return error.InvalidStartFuncIndex;
             }
 
-            const start_func_addr = module_inst.func_addrs[start_func_idx_usize];
-            _ = try self.invokeFunc(start_func_addr);
+            start_func_addr = module_inst.func_addrs[start_func_idx_usize];
+        }
+
+        return try Runtime.init(allocator, store, module_inst, start_func_addr);
+    }
+
+    pub fn invokeStartFunc(self: *Runtime) !void {
+        if (self.start_func_addr) |addr| {
+            _ = try self.invokeFunc(addr);
         }
     }
 
-    pub fn invokeExportedFunc(self: *Runtime, module_inst: *const ModuleInstance, export_name: types.Name) !?Value {
-        for (module_inst.exports) |exp| {
+    pub fn invokeExportedFunc(self: *Runtime, export_name: types.Name) !?Value {
+        for (self.module.exports) |exp| {
             if (std.mem.eql(u8, exp.name, export_name)) {
                 return switch (exp.value) {
                     .func => |func_addr| try self.invokeFunc(func_addr),
@@ -1279,68 +1318,13 @@ pub const Runtime = struct {
 
         while (pc < self.bytecode.instrs.len) {
             const instr = self.bytecode.instrs[pc];
-            std.debug.print("{any} {any}\n", .{ instr, self.stack.items });
+            // std.debug.print("{any} {any}\n", .{ instr, self.stack.items });
 
             switch (instr) {
                 .@"unreachable" => {
                     return error.Unreachable;
                 },
                 .nop => {
-                    pc += 1;
-                },
-                .drop => {
-                    _ = try self.pop();
-                    pc += 1;
-                },
-                .i32_const => |n| {
-                    try self.push(.{ .i32 = n });
-                    pc += 1;
-                },
-                .i64_const => |n| {
-                    try self.push(.{ .i64 = n });
-                    pc += 1;
-                },
-                .f32_const => |x| {
-                    try self.push(.{ .f32 = x });
-                    pc += 1;
-                },
-                .f64_const => |x| {
-                    try self.push(.{ .f64 = x });
-                    pc += 1;
-                },
-                .local_get => |local_idx| {
-                    const val = try self.getLocal(local_idx);
-                    try self.push(val);
-                    pc += 1;
-                },
-                .local_set => |local_idx| {
-                    const val = try self.pop();
-                    try self.setLocal(local_idx, val);
-                    pc += 1;
-                },
-                .local_tee => |local_idx| {
-                    const val = try self.peek();
-                    try self.setLocal(local_idx, val);
-                    pc += 1;
-                },
-                .i32_eqz => {
-                    const val = try self.pop();
-                    try self.pushBool(val.i32 == 0);
-                    pc += 1;
-                },
-                .i32_add => {
-                    const args = try self.popArgs(2);
-                    try self.push(.{ .i32 = args[0].i32 +% args[1].i32 });
-                    pc += 1;
-                },
-                .i32_sub => {
-                    const args = try self.popArgs(2);
-                    try self.push(.{ .i32 = args[0].i32 -% args[1].i32 });
-                    pc += 1;
-                },
-                .i32_mul => {
-                    const args = try self.popArgs(2);
-                    try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
                     pc += 1;
                 },
                 .call => |call| {
@@ -1382,6 +1366,137 @@ pub const Runtime = struct {
                     } else {
                         pc += 1;
                     }
+                },
+                .drop => {
+                    _ = try self.pop();
+                    pc += 1;
+                },
+                .select => {
+                    const args = try self.popArgs(3);
+                    const condition = args[2];
+                    try self.push(if (condition.i32 != 0) args[0] else args[1]);
+                    pc += 1;
+                },
+                .local_get => |local_idx| {
+                    const val = try self.getLocal(local_idx);
+                    try self.push(val);
+                    pc += 1;
+                },
+                .local_set => |local_idx| {
+                    const val = try self.pop();
+                    try self.setLocal(local_idx, val);
+                    pc += 1;
+                },
+                .local_tee => |local_idx| {
+                    const val = try self.peek();
+                    try self.setLocal(local_idx, val);
+                    pc += 1;
+                },
+                .i32_const => |n| {
+                    try self.push(.{ .i32 = n });
+                    pc += 1;
+                },
+                .i32_eqz => {
+                    const val = try self.pop();
+                    try self.pushBool(val.i32 == 0);
+                    pc += 1;
+                },
+                .i32_eq => {
+                    const args = try self.popArgs(2);
+                    try self.pushBool(args[0].i32 == args[1].i32);
+                    pc += 1;
+                },
+                .i32_and => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 & args[1].i32 });
+                    pc += 1;
+                },
+                .i32_or => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 | args[1].i32 });
+                    pc += 1;
+                },
+                .i32_xor => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 ^ args[1].i32 });
+                    pc += 1;
+                },
+                .i32_add => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 +% args[1].i32 });
+                    pc += 1;
+                },
+                .i32_sub => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 -% args[1].i32 });
+                    pc += 1;
+                },
+                .i32_mul => {
+                    const args = try self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
+                    pc += 1;
+                },
+                .i32_le_u => {
+                    const args = try self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs <= rhs);
+                    pc += 1;
+                },
+                .i32_lt_u => {
+                    const args = try self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs < rhs);
+                    pc += 1;
+                },
+                .i32_gt_u => {
+                    const args = try self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs > rhs);
+                    pc += 1;
+                },
+                .i32_gt_s => {
+                    const args = try self.popArgs(2);
+                    try self.pushBool(args[0].i32 > args[1].i32);
+                    pc += 1;
+                },
+                .i32_rem_u => {
+                    const args = try self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+
+                    if (rhs == 0) {
+                        return error.IntegerDivideByZero;
+                    }
+
+                    try self.push(.{ .i32 = @bitCast(@rem(lhs, rhs)) });
+                    pc += 1;
+                },
+                .i32_rem_s => {
+                    const args = try self.popArgs(2);
+                    const lhs: i32 = args[0].i32;
+                    const rhs: i32 = args[1].i32;
+
+                    if (rhs == 0) {
+                        return error.IntegerDivideByZero;
+                    }
+
+                    try self.push(.{ .i32 = @rem(lhs, rhs) });
+                    pc += 1;
+                },
+                .i64_const => |n| {
+                    try self.push(.{ .i64 = n });
+                    pc += 1;
+                },
+                .f32_const => |x| {
+                    try self.push(.{ .f32 = x });
+                    pc += 1;
+                },
+                .f64_const => |x| {
+                    try self.push(.{ .f64 = x });
+                    pc += 1;
                 },
                 else => {
                     std.debug.print("Unsupported instruction: {any}\n", .{instr});
