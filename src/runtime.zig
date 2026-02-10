@@ -16,9 +16,9 @@ const MemArg = struct {
     mem: *const MemoryInstance,
 };
 
-const CallIndirectArg = struct {
-    func_type: types.FuncType,
-    table: *const TableInstance,
+const BranchTableArg = struct {
+    label_pcs: []PC,
+    default_pc: PC,
 };
 
 pub const FlatInstr = union(enum) {
@@ -27,10 +27,10 @@ pub const FlatInstr = union(enum) {
     nop,
     br: PC,
     br_if: PC,
-    br_table: struct { label_indices: []PC, default_idx: PC },
+    br_table: BranchTableArg,
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
-    call_indirect: CallIndirectArg,
+    call_indirect: struct { func_type: types.FuncType, table: *const TableInstance },
     call_host: *const HostFunc,
 
     // Parametric instructions
@@ -201,12 +201,17 @@ pub const FlatInstr = union(enum) {
     f64_reinterpret_i64,
 };
 
+const BranchToPatch = union(enum) {
+    br_patch: usize, // branch instruction index
+    br_table_patch: struct { instr_idx: usize, label: union(enum) { default, index: usize } },
+};
+
 pub const BlockLabelKind = enum { block, loop, @"if" };
 pub const BlockLabel = struct {
     kind: BlockLabelKind,
     start: PC,
     end: PC,
-    branches_to_patch: ArrayList(usize),
+    branches_to_patch: ArrayList(BranchToPatch),
 
     fn deinit(self: *BlockLabel, allocator: Allocator) void {
         self.branches_to_patch.deinit(allocator);
@@ -227,6 +232,15 @@ pub const Bytecode = struct {
     functions: []?PC, // store function addr -> entry program counter
 
     pub fn deinit(self: *Bytecode, allocator: Allocator) void {
+        for (self.instrs) |instr| {
+            switch (instr) {
+                .br_table => |arg| {
+                    allocator.free(arg.label_pcs);
+                },
+                else => {},
+            }
+        }
+
         allocator.free(self.instrs);
         allocator.free(self.functions);
     }
@@ -354,16 +368,41 @@ const BytecodeLowering = struct {
     }
 
     fn patchBranches(self: *BytecodeLowering, label: *const BlockLabel) !void {
-        for (label.branches_to_patch.items) |branch_idx| {
-            switch (self.flat.items[branch_idx]) {
-                .br => |*pc| {
-                    pc.* = label.end;
+        for (label.branches_to_patch.items) |entry| {
+            switch (entry) {
+                .br_patch => |instr_idx| {
+                    switch (self.flat.items[instr_idx]) {
+                        .br => |*pc| {
+                            pc.* = label.end;
+                        },
+                        .br_if => |*pc| {
+                            pc.* = label.end;
+                        },
+                        else => {
+                            return error.InvalidBranchInstructionForPatching;
+                        },
+                    }
                 },
-                .br_if => |*pc| {
-                    pc.* = label.end;
-                },
-                else => {
-                    return error.InvalidBranchInstructionForPatching;
+                .br_table_patch => |arg| {
+                    switch (self.flat.items[arg.instr_idx]) {
+                        .br_table => |*table| {
+                            switch (arg.label) {
+                                .default => {
+                                    table.default_pc = label.end;
+                                },
+                                .index => |label_idx| {
+                                    if (label_idx >= table.label_pcs.len) {
+                                        return error.InvalidBranchTableLabelIndexForPatching;
+                                    }
+
+                                    table.label_pcs[label_idx] = label.end;
+                                },
+                            }
+                        },
+                        else => {
+                            return error.InvalidBranchTableInstructionForPatching;
+                        },
+                    }
                 },
             }
         }
@@ -377,6 +416,27 @@ const BytecodeLowering = struct {
             .offset = memarg.offset,
             .mem = &self.store.mems.items[mem_addr],
         };
+    }
+
+    fn registerBranchPatch(self: *BytecodeLowering, pc: *PC, label_idx: usize, patch: BranchToPatch) !void {
+        if (self.block_labels.items.len <= label_idx) {
+            return error.InvalidLabelIndex;
+        }
+
+        const label = &self.block_labels.items[self.block_labels.items.len - 1 - label_idx];
+
+        switch (label.kind) {
+            .loop => {
+                // Branch to the start of the loop
+                pc.* = label.start;
+            },
+            .block, .@"if" => {
+                // Emit a placeholder branch instruction and record it for patching
+                try label.branches_to_patch.append(self.allocator, patch);
+
+                pc.* = 0; // Placeholder
+            },
+        }
     }
 
     fn lowerInstr(self: *BytecodeLowering, instr: types.Instr) !void {
@@ -432,8 +492,12 @@ const BytecodeLowering = struct {
                 }
 
                 // Unconditionally jump to end of if after then block
-                try self.block_labels.items[exit_label_idx].branches_to_patch.append(self.allocator, self.flat.items.len);
+                try self.block_labels.items[exit_label_idx].branches_to_patch.append(self.allocator, BranchToPatch{
+                    .br_patch = self.flat.items.len,
+                });
+
                 try self.emit(.{ .br = 0 });
+
                 self.flat.items[else_jump_idx] = .{ .br_if = self.flat.items.len }; // Patch branch to else block
 
                 for (if_.else_instructions) |else_instr| {
@@ -465,7 +529,10 @@ const BytecodeLowering = struct {
                     .block, .@"if" => {
                         // Emit a placeholder branch instruction and record it for patching
                         const patch_idx = self.flat.items.len;
-                        try label.branches_to_patch.append(self.allocator, patch_idx);
+                        try label.branches_to_patch.append(self.allocator, BranchToPatch{
+                            .br_patch = patch_idx,
+                        });
+
                         try self.emit(switch (instr) {
                             .br => .{ .br = 0 },
                             .br_if => .{ .br_if = 0 },
@@ -473,6 +540,31 @@ const BytecodeLowering = struct {
                         });
                     },
                 }
+            },
+            .br_table => |arg| {
+                const label_pcs = try self.allocator.alloc(PC, arg.label_indices.len);
+                errdefer self.allocator.free(label_pcs);
+                const instr_idx = self.flat.items.len;
+
+                for (label_pcs, 0..) |*pc, i| {
+                    const label_idx = arg.label_indices[i];
+                    try self.registerBranchPatch(pc, label_idx, BranchToPatch{ .br_table_patch = .{
+                        .instr_idx = instr_idx,
+                        .label = .{ .index = i },
+                    } });
+                }
+
+                var br_table_arg = BranchTableArg{
+                    .label_pcs = label_pcs,
+                    .default_pc = 0, // To be patched
+                };
+
+                try self.registerBranchPatch(&br_table_arg.default_pc, arg.default_idx, BranchToPatch{ .br_table_patch = .{
+                    .instr_idx = instr_idx,
+                    .label = .default,
+                } });
+
+                try self.emit(.{ .br_table = .{ .label_pcs = label_pcs, .default_pc = 0 } });
             },
             .call => |func_idx| {
                 const call_instr_idx = self.flat.items.len;
@@ -679,10 +771,6 @@ const BytecodeLowering = struct {
             .i64_reinterpret_f64 => try self.emit(.i64_reinterpret_f64),
             .f32_reinterpret_i32 => try self.emit(.f32_reinterpret_i32),
             .f64_reinterpret_i64 => try self.emit(.f64_reinterpret_i64),
-            else => {
-                std.debug.print("{any}\n", .{instr});
-                return error.UnhandledInstructionForLowering;
-            },
         }
     }
 };
@@ -1461,6 +1549,15 @@ pub const Runtime = struct {
                         pc = target_pc;
                     } else {
                         pc += 1;
+                    }
+                },
+                .br_table => |table| {
+                    const i: usize = @intCast(self.pop().i32);
+
+                    if (i < table.label_pcs.len) {
+                        pc = table.label_pcs[i];
+                    } else {
+                        pc = table.default_pc;
                     }
                 },
                 .drop => {
