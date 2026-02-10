@@ -45,6 +45,15 @@ pub const Value = union(enum) {
             .f64 => .f64,
         };
     }
+
+    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .i32 => try writer.print("{d}", .{self.i32}),
+            .i64 => try writer.print("{d}", .{self.i64}),
+            .f32 => try writer.print("{d}", .{self.f32}),
+            .f64 => try writer.print("{d}", .{self.f64}),
+        }
+    }
 };
 
 pub const Result = Value;

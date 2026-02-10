@@ -36,15 +36,19 @@ fn run(allocator: std.mem.Allocator) !void {
     var vm = try runtime.Runtime.from(arena.allocator(), wasm_path);
     defer vm.deinit();
 
-    var result: ?types.Value = null;
-
     if (args.len == 2) {
         try vm.invokeStartFunc();
     } else {
-        result = try vm.invokeExportedFunc(args[2]);
-    }
+        const results = try vm.invokeExportedFunc(args[2]);
 
-    if (result) |res| {
-        std.debug.print("{any}\n", .{res});
+        for (results, 0..) |res, i| {
+            std.debug.print("{f}", .{res});
+
+            if (i != results.len - 1) {
+                std.debug.print(", ", .{});
+            }
+        }
+
+        std.debug.print("\n", .{});
     }
 }

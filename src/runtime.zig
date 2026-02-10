@@ -1073,7 +1073,7 @@ pub const ModuleInstance = struct {
 
 const HostFunc = struct {
     type: types.FuncType,
-    code: *const fn ([]Value) anyerror!?Value,
+    code: *const fn ([]Value) anyerror![]Value,
 };
 
 const FuncInstance = union(enum) {
@@ -1192,7 +1192,7 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn invokeExportedFunc(self: *Runtime, export_name: types.Name) !?Value {
+    pub fn invokeExportedFunc(self: *Runtime, export_name: types.Name) ![]Value {
         for (self.module.exports) |exp| {
             if (std.mem.eql(u8, exp.name, export_name)) {
                 return switch (exp.value) {
@@ -1205,7 +1205,7 @@ pub const Runtime = struct {
         return error.ExportNotFound;
     }
 
-    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr) !?Value {
+    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr) ![]Value {
         const func_inst = self.store.funcs.items[func_addr];
         const func_type = func_inst.getType();
 
@@ -1234,9 +1234,9 @@ pub const Runtime = struct {
 
                 if (self.bytecode.functions[func_addr]) |entry_pc| {
                     try self.execute(entry_pc);
-                    var result: ?Value = null;
+                    var result: []Value = &[_]Value{};
                     if (wasm_func.type.results.len > 0) {
-                        result = try self.pop();
+                        result = self.popArgs(wasm_func.type.results.len);
                     }
 
                     self.stack.shrinkRetainingCapacity(base_ptr);
@@ -1262,29 +1262,19 @@ pub const Runtime = struct {
         try self.push(.{ .i32 = if (b) 1 else 0 });
     }
 
-    fn popUnsafe(self: *Runtime) Value {
-        const val = self.stack.items[self.stack.items.len - 1];
-        self.stack.items.len -= 1;
-        return val;
-    }
-
-    fn popArgs(self: *Runtime, comptime n: usize) ![]Value {
-        if (self.stack.items.len < n) {
-            return error.ValueStackUnderflow;
-        }
-
+    fn popArgs(self: *Runtime, n: usize) []Value {
+        std.debug.assert(self.stack.items.len >= n);
         const len = self.stack.items.len;
         const slice = self.stack.items[len - n .. len];
         self.stack.items.len -= n;
         return slice;
     }
 
-    fn pop(self: *Runtime) !Value {
-        if (self.stack.items.len == 0) {
-            return error.ValueStackUnderflow;
-        }
-
-        return self.popUnsafe();
+    fn pop(self: *Runtime) Value {
+        std.debug.assert(self.stack.items.len > 0);
+        const val = self.stack.items[self.stack.items.len - 1];
+        self.stack.items.len -= 1;
+        return val;
     }
 
     fn peek(self: *Runtime) !Value {
@@ -1359,7 +1349,7 @@ pub const Runtime = struct {
                     pc = target_pc;
                 },
                 .br_if => |target_pc| {
-                    const condition = try self.pop();
+                    const condition = self.pop();
 
                     if (condition.i32 != 0) {
                         pc = target_pc;
@@ -1368,11 +1358,11 @@ pub const Runtime = struct {
                     }
                 },
                 .drop => {
-                    _ = try self.pop();
+                    self.stack.items.len -= 1;
                     pc += 1;
                 },
                 .select => {
-                    const args = try self.popArgs(3);
+                    const args = self.popArgs(3);
                     const condition = args[2];
                     try self.push(if (condition.i32 != 0) args[0] else args[1]);
                     pc += 1;
@@ -1383,7 +1373,7 @@ pub const Runtime = struct {
                     pc += 1;
                 },
                 .local_set => |local_idx| {
-                    const val = try self.pop();
+                    const val = self.pop();
                     try self.setLocal(local_idx, val);
                     pc += 1;
                 },
@@ -1397,73 +1387,71 @@ pub const Runtime = struct {
                     pc += 1;
                 },
                 .i32_eqz => {
-                    const val = try self.pop();
+                    const val = self.pop();
                     try self.pushBool(val.i32 == 0);
                     pc += 1;
                 },
                 .i32_eq => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.pushBool(args[0].i32 == args[1].i32);
                     pc += 1;
                 },
                 .i32_and => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.push(.{ .i32 = args[0].i32 & args[1].i32 });
                     pc += 1;
                 },
                 .i32_or => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.push(.{ .i32 = args[0].i32 | args[1].i32 });
                     pc += 1;
                 },
                 .i32_xor => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.push(.{ .i32 = args[0].i32 ^ args[1].i32 });
                     pc += 1;
                 },
                 .i32_add => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.push(.{ .i32 = args[0].i32 +% args[1].i32 });
                     pc += 1;
                 },
                 .i32_sub => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.push(.{ .i32 = args[0].i32 -% args[1].i32 });
                     pc += 1;
                 },
                 .i32_mul => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
                     pc += 1;
                 },
-                .i32_le_u => {
-                    const args = try self.popArgs(2);
+                .i32_div_u => {
+                    const args = self.popArgs(2);
                     const lhs: u32 = @bitCast(args[0].i32);
                     const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs <= rhs);
+
+                    if (rhs == 0) {
+                        return error.IntegerDivideByZero;
+                    }
+
+                    try self.push(.{ .i32 = @bitCast(lhs / rhs) });
                     pc += 1;
                 },
-                .i32_lt_u => {
-                    const args = try self.popArgs(2);
-                    const lhs: u32 = @bitCast(args[0].i32);
-                    const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs < rhs);
-                    pc += 1;
-                },
-                .i32_gt_u => {
-                    const args = try self.popArgs(2);
-                    const lhs: u32 = @bitCast(args[0].i32);
-                    const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs > rhs);
-                    pc += 1;
-                },
-                .i32_gt_s => {
-                    const args = try self.popArgs(2);
-                    try self.pushBool(args[0].i32 > args[1].i32);
+                .i32_div_s => {
+                    const args = self.popArgs(2);
+                    const lhs: i32 = args[0].i32;
+                    const rhs: i32 = args[1].i32;
+
+                    if (rhs == 0) {
+                        return error.IntegerDivideByZero;
+                    }
+
+                    try self.push(.{ .i32 = @divExact(lhs, rhs) });
                     pc += 1;
                 },
                 .i32_rem_u => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     const lhs: u32 = @bitCast(args[0].i32);
                     const rhs: u32 = @bitCast(args[1].i32);
 
@@ -1475,7 +1463,7 @@ pub const Runtime = struct {
                     pc += 1;
                 },
                 .i32_rem_s => {
-                    const args = try self.popArgs(2);
+                    const args = self.popArgs(2);
                     const lhs: i32 = args[0].i32;
                     const rhs: i32 = args[1].i32;
 
@@ -1484,6 +1472,70 @@ pub const Runtime = struct {
                     }
 
                     try self.push(.{ .i32 = @rem(lhs, rhs) });
+                    pc += 1;
+                },
+                .i32_shr_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    const shift_amount: u5 = @intCast(rhs);
+                    try self.push(.{ .i32 = @bitCast(lhs >> shift_amount) });
+                    pc += 1;
+                },
+                .i32_shr_s => {
+                    const args = self.popArgs(2);
+                    const lhs = args[0].i32;
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    const shift_amount: u5 = @intCast(rhs);
+                    try self.push(.{ .i32 = lhs >> shift_amount });
+                    pc += 1;
+                },
+                .i32_le_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs <= rhs);
+                    pc += 1;
+                },
+                .i32_le_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 <= args[1].i32);
+                    pc += 1;
+                },
+                .i32_lt_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs < rhs);
+                    pc += 1;
+                },
+                .i32_lt_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 < args[1].i32);
+                    pc += 1;
+                },
+                .i32_gt_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs > rhs);
+                    pc += 1;
+                },
+                .i32_gt_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 > args[1].i32);
+                    pc += 1;
+                },
+                .i32_ge_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs >= rhs);
+                    pc += 1;
+                },
+                .i32_ge_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 >= args[1].i32);
                     pc += 1;
                 },
                 .i64_const => |n| {

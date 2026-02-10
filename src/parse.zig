@@ -168,10 +168,6 @@ pub const Parser = struct {
         const params = try self.readVector(types.ValType, Self.readValType);
         const results = try self.readVector(types.ValType, Self.readValType);
 
-        if (results.len > 1) {
-            return error.MultipleResultTypesNotSupported;
-        }
-
         return .{ .params = params, .results = results };
     }
 
