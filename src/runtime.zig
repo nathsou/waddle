@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const parse = @import("parse.zig");
+const wat = @import("wat.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const Value = types.Value;
@@ -1535,22 +1536,37 @@ pub const Runtime = struct {
         const file = try std.fs.cwd().openFile(module_path, .{});
         defer file.close();
         const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
-        var parser = parse.Parser.init(allocator, bytes);
-        const module = try parser.readModule();
-        const module_inst = try store.instantiate(module, &.{});
 
-        var start_func_addr: ?FuncAddr = null;
-        if (module.start) |start_func_idx| {
-            const start_func_idx_usize = @as(usize, start_func_idx);
+        if (std.ascii.endsWithIgnoreCase(module_path, ".wasm")) {
+            var parser = parse.Parser.init(allocator, bytes);
+            const module = try parser.readModule();
+            const module_inst = try store.instantiate(module, &.{});
 
-            if (start_func_idx_usize >= module_inst.func_addrs.len) {
-                return error.InvalidStartFuncIndex;
+            var start_func_addr: ?FuncAddr = null;
+            if (module.start) |start_func_idx| {
+                const start_func_idx_usize = @as(usize, start_func_idx);
+
+                if (start_func_idx_usize >= module_inst.func_addrs.len) {
+                    return error.InvalidStartFuncIndex;
+                }
+
+                start_func_addr = module_inst.func_addrs[start_func_idx_usize];
             }
 
-            start_func_addr = module_inst.func_addrs[start_func_idx_usize];
-        }
+            return try Runtime.init(allocator, store, module_inst, start_func_addr);
+        } else if (std.ascii.endsWithIgnoreCase(module_path, ".wat")) {
+            var lexer = wat.Lexer.init(bytes);
 
-        return try Runtime.init(allocator, store, module_inst, start_func_addr);
+            while (try lexer.next()) |token| {
+                std.debug.print("{f} ", .{token.token});
+            }
+
+            std.debug.print("\n\n", .{});
+
+            return error.WatNotSupportedYet;
+        } else {
+            return error.UnsupportedModuleFormat;
+        }
     }
 
     pub fn invokeStartFunc(self: *Runtime) !void {
