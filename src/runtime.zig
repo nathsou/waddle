@@ -199,6 +199,207 @@ pub const FlatInstr = union(enum) {
     i64_reinterpret_f64,
     f32_reinterpret_i32,
     f64_reinterpret_i64,
+
+    pub fn format(self: FlatInstr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            // Control instructions
+            .@"unreachable" => try writer.writeAll("unreachable"),
+            .nop => try writer.writeAll("nop"),
+            .br => |target| try writer.print("br {d}", .{target}),
+            .br_if => |target| try writer.print("br_if {d}", .{target}),
+            .br_table => |arg| {
+                try writer.writeAll("br_table [");
+                for (arg.label_pcs, 0..) |pc_val, i| {
+                    try writer.print("{d}", .{pc_val});
+                    if (i != arg.label_pcs.len - 1) try writer.writeAll(", ");
+                }
+                try writer.print("] default={d}", .{arg.default_pc});
+            },
+            .@"return" => try writer.print("return", .{}),
+            .call => |arg| try writer.print("call pc={d} args={d}", .{ arg.entry_pc, arg.arguments }),
+            .call_indirect => try writer.writeAll("call_indirect"),
+            .call_host => try writer.writeAll("call_host"),
+
+            // Parametric instructions
+            .drop => try writer.writeAll("drop"),
+            .select => try writer.writeAll("select"),
+
+            // Variable instructions
+            .local_get => |idx| try writer.print("local.get {d}", .{idx}),
+            .local_set => |idx| try writer.print("local.set {d}", .{idx}),
+            .local_tee => |idx| try writer.print("local.tee {d}", .{idx}),
+            .global_get => try writer.writeAll("global.get"),
+            .global_set => try writer.writeAll("global.set"),
+
+            // Memory instructions
+            .i32_load => |arg| try writer.print("i32.load offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load => |arg| try writer.print("i64.load offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .f32_load => |arg| try writer.print("f32.load offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .f64_load => |arg| try writer.print("f64.load offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_load8_s => |arg| try writer.print("i32.load8_s offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_load8_u => |arg| try writer.print("i32.load8_u offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_load16_s => |arg| try writer.print("i32.load16_s offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_load16_u => |arg| try writer.print("i32.load16_u offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load8_s => |arg| try writer.print("i64.load8_s offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load8_u => |arg| try writer.print("i64.load8_u offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load16_s => |arg| try writer.print("i64.load16_s offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load16_u => |arg| try writer.print("i64.load16_u offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load32_s => |arg| try writer.print("i64.load32_s offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_load32_u => |arg| try writer.print("i64.load32_u offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_store => |arg| try writer.print("i32.store offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_store => |arg| try writer.print("i64.store offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .f32_store => |arg| try writer.print("f32.store offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .f64_store => |arg| try writer.print("f64.store offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_store8 => |arg| try writer.print("i32.store8 offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i32_store16 => |arg| try writer.print("i32.store16 offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_store8 => |arg| try writer.print("i64.store8 offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_store16 => |arg| try writer.print("i64.store16 offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .i64_store32 => |arg| try writer.print("i64.store32 offset={d} align={d}", .{ arg.offset, arg.alignment }),
+            .memory_size => try writer.writeAll("memory.size"),
+            .memory_grow => try writer.writeAll("memory.grow"),
+
+            // Numeric instructions - constants
+            .i32_const => |val| try writer.print("i32.const {d}", .{val}),
+            .i64_const => |val| try writer.print("i64.const {d}", .{val}),
+            .f32_const => |val| try writer.print("f32.const {d}", .{val}),
+            .f64_const => |val| try writer.print("f64.const {d}", .{val}),
+
+            // Numeric instructions - comparisons
+            .i32_eqz => try writer.writeAll("i32.eqz"),
+            .i32_eq => try writer.writeAll("i32.eq"),
+            .i32_ne => try writer.writeAll("i32.ne"),
+            .i32_lt_s => try writer.writeAll("i32.lt_s"),
+            .i32_lt_u => try writer.writeAll("i32.lt_u"),
+            .i32_gt_s => try writer.writeAll("i32.gt_s"),
+            .i32_gt_u => try writer.writeAll("i32.gt_u"),
+            .i32_le_s => try writer.writeAll("i32.le_s"),
+            .i32_le_u => try writer.writeAll("i32.le_u"),
+            .i32_ge_s => try writer.writeAll("i32.ge_s"),
+            .i32_ge_u => try writer.writeAll("i32.ge_u"),
+            .i64_eqz => try writer.writeAll("i64.eqz"),
+            .i64_eq => try writer.writeAll("i64.eq"),
+            .i64_ne => try writer.writeAll("i64.ne"),
+            .i64_lt_s => try writer.writeAll("i64.lt_s"),
+            .i64_lt_u => try writer.writeAll("i64.lt_u"),
+            .i64_gt_s => try writer.writeAll("i64.gt_s"),
+            .i64_gt_u => try writer.writeAll("i64.gt_u"),
+            .i64_le_s => try writer.writeAll("i64.le_s"),
+            .i64_le_u => try writer.writeAll("i64.le_u"),
+            .i64_ge_s => try writer.writeAll("i64.ge_s"),
+            .i64_ge_u => try writer.writeAll("i64.ge_u"),
+            .f32_eq => try writer.writeAll("f32.eq"),
+            .f32_ne => try writer.writeAll("f32.ne"),
+            .f32_lt => try writer.writeAll("f32.lt"),
+            .f32_gt => try writer.writeAll("f32.gt"),
+            .f32_le => try writer.writeAll("f32.le"),
+            .f32_ge => try writer.writeAll("f32.ge"),
+            .f64_eq => try writer.writeAll("f64.eq"),
+            .f64_ne => try writer.writeAll("f64.ne"),
+            .f64_lt => try writer.writeAll("f64.lt"),
+            .f64_gt => try writer.writeAll("f64.gt"),
+            .f64_le => try writer.writeAll("f64.le"),
+            .f64_ge => try writer.writeAll("f64.ge"),
+
+            // Numeric instructions - i32 operations
+            .i32_clz => try writer.writeAll("i32.clz"),
+            .i32_ctz => try writer.writeAll("i32.ctz"),
+            .i32_popcnt => try writer.writeAll("i32.popcnt"),
+            .i32_add => try writer.writeAll("i32.add"),
+            .i32_sub => try writer.writeAll("i32.sub"),
+            .i32_mul => try writer.writeAll("i32.mul"),
+            .i32_div_s => try writer.writeAll("i32.div_s"),
+            .i32_div_u => try writer.writeAll("i32.div_u"),
+            .i32_rem_s => try writer.writeAll("i32.rem_s"),
+            .i32_rem_u => try writer.writeAll("i32.rem_u"),
+            .i32_and => try writer.writeAll("i32.and"),
+            .i32_or => try writer.writeAll("i32.or"),
+            .i32_xor => try writer.writeAll("i32.xor"),
+            .i32_shl => try writer.writeAll("i32.shl"),
+            .i32_shr_s => try writer.writeAll("i32.shr_s"),
+            .i32_shr_u => try writer.writeAll("i32.shr_u"),
+            .i32_rotl => try writer.writeAll("i32.rotl"),
+            .i32_rotr => try writer.writeAll("i32.rotr"),
+
+            // Numeric instructions - i64 operations
+            .i64_clz => try writer.writeAll("i64.clz"),
+            .i64_ctz => try writer.writeAll("i64.ctz"),
+            .i64_popcnt => try writer.writeAll("i64.popcnt"),
+            .i64_add => try writer.writeAll("i64.add"),
+            .i64_sub => try writer.writeAll("i64.sub"),
+            .i64_mul => try writer.writeAll("i64.mul"),
+            .i64_div_s => try writer.writeAll("i64.div_s"),
+            .i64_div_u => try writer.writeAll("i64.div_u"),
+            .i64_rem_s => try writer.writeAll("i64.rem_s"),
+            .i64_rem_u => try writer.writeAll("i64.rem_u"),
+            .i64_and => try writer.writeAll("i64.and"),
+            .i64_or => try writer.writeAll("i64.or"),
+            .i64_xor => try writer.writeAll("i64.xor"),
+            .i64_shl => try writer.writeAll("i64.shl"),
+            .i64_shr_s => try writer.writeAll("i64.shr_s"),
+            .i64_shr_u => try writer.writeAll("i64.shr_u"),
+            .i64_rotl => try writer.writeAll("i64.rotl"),
+            .i64_rotr => try writer.writeAll("i64.rotr"),
+
+            // Numeric instructions - f32 operations
+            .f32_abs => try writer.writeAll("f32.abs"),
+            .f32_neg => try writer.writeAll("f32.neg"),
+            .f32_ceil => try writer.writeAll("f32.ceil"),
+            .f32_floor => try writer.writeAll("f32.floor"),
+            .f32_trunc => try writer.writeAll("f32.trunc"),
+            .f32_nearest => try writer.writeAll("f32.nearest"),
+            .f32_sqrt => try writer.writeAll("f32.sqrt"),
+            .f32_add => try writer.writeAll("f32.add"),
+            .f32_sub => try writer.writeAll("f32.sub"),
+            .f32_mul => try writer.writeAll("f32.mul"),
+            .f32_div => try writer.writeAll("f32.div"),
+            .f32_min => try writer.writeAll("f32.min"),
+            .f32_max => try writer.writeAll("f32.max"),
+            .f32_copysign => try writer.writeAll("f32.copysign"),
+
+            // Numeric instructions - f64 operations
+            .f64_abs => try writer.writeAll("f64.abs"),
+            .f64_neg => try writer.writeAll("f64.neg"),
+            .f64_ceil => try writer.writeAll("f64.ceil"),
+            .f64_floor => try writer.writeAll("f64.floor"),
+            .f64_trunc => try writer.writeAll("f64.trunc"),
+            .f64_nearest => try writer.writeAll("f64.nearest"),
+            .f64_sqrt => try writer.writeAll("f64.sqrt"),
+            .f64_add => try writer.writeAll("f64.add"),
+            .f64_sub => try writer.writeAll("f64.sub"),
+            .f64_mul => try writer.writeAll("f64.mul"),
+            .f64_div => try writer.writeAll("f64.div"),
+            .f64_min => try writer.writeAll("f64.min"),
+            .f64_max => try writer.writeAll("f64.max"),
+            .f64_copysign => try writer.writeAll("f64.copysign"),
+
+            // Conversion instructions
+            .i32_wrap_i64 => try writer.writeAll("i32.wrap_i64"),
+            .i32_trunc_f32_s => try writer.writeAll("i32.trunc_f32_s"),
+            .i32_trunc_f32_u => try writer.writeAll("i32.trunc_f32_u"),
+            .i32_trunc_f64_s => try writer.writeAll("i32.trunc_f64_s"),
+            .i32_trunc_f64_u => try writer.writeAll("i32.trunc_f64_u"),
+            .i64_extend_i32_s => try writer.writeAll("i64.extend_i32_s"),
+            .i64_extend_i32_u => try writer.writeAll("i64.extend_i32_u"),
+            .i64_trunc_f32_s => try writer.writeAll("i64.trunc_f32_s"),
+            .i64_trunc_f32_u => try writer.writeAll("i64.trunc_f32_u"),
+            .i64_trunc_f64_s => try writer.writeAll("i64.trunc_f64_s"),
+            .i64_trunc_f64_u => try writer.writeAll("i64.trunc_f64_u"),
+            .f32_convert_i32_s => try writer.writeAll("f32.convert_i32_s"),
+            .f32_convert_i32_u => try writer.writeAll("f32.convert_i32_u"),
+            .f32_convert_i64_s => try writer.writeAll("f32.convert_i64_s"),
+            .f32_convert_i64_u => try writer.writeAll("f32.convert_i64_u"),
+            .f32_demote_f64 => try writer.writeAll("f32.demote_f64"),
+            .f64_convert_i32_s => try writer.writeAll("f64.convert_i32_s"),
+            .f64_convert_i32_u => try writer.writeAll("f64.convert_i32_u"),
+            .f64_convert_i64_s => try writer.writeAll("f64.convert_i64_s"),
+            .f64_convert_i64_u => try writer.writeAll("f64.convert_i64_u"),
+            .f64_promote_f32 => try writer.writeAll("f64.promote_f32"),
+            .i32_reinterpret_f32 => try writer.writeAll("i32.reinterpret_f32"),
+            .i64_reinterpret_f64 => try writer.writeAll("i64.reinterpret_f64"),
+            .f32_reinterpret_i32 => try writer.writeAll("f32.reinterpret_i32"),
+            .f64_reinterpret_i64 => try writer.writeAll("f64.reinterpret_i64"),
+        }
+    }
 };
 
 const BranchToPatch = union(enum) {
@@ -243,6 +444,32 @@ pub const Bytecode = struct {
 
         allocator.free(self.instrs);
         allocator.free(self.functions);
+    }
+
+    pub fn format(self: *const Bytecode, writer: *std.Io.Writer) !void {
+        try writer.writeAll("\n=== Bytecode Instructions ===\n");
+        try writer.print("Total instructions: {d}\n", .{self.instrs.len});
+        try writer.print("Function count: {d}\n\n", .{self.functions.len});
+
+        // Print function entry points
+        try writer.writeAll("Function Entry Points:\n");
+        for (self.functions, 0..) |maybe_entry, func_idx| {
+            if (maybe_entry) |entry| {
+                try writer.print("  func[{d}] -> {d}\n", .{ func_idx, entry });
+            }
+        }
+        try writer.writeAll("\n");
+
+        // Print instructions
+        try writer.writeAll("Instructions:\n");
+
+        for (self.instrs, 0..) |instr, pc| {
+            try writer.print("  {d:4}: ", .{pc});
+            try instr.format(writer);
+            try writer.writeAll("\n");
+        }
+
+        try writer.writeAll("=============================\n\n");
     }
 };
 
@@ -1474,7 +1701,6 @@ pub const Runtime = struct {
 
         while (pc < self.bytecode.instrs.len) {
             const instr = self.bytecode.instrs[pc];
-            // std.debug.print("{any} {any}\n", .{ instr, self.stack.items });
 
             switch (instr) {
                 .@"unreachable" => {
@@ -1482,6 +1708,47 @@ pub const Runtime = struct {
                 },
                 .nop => {
                     pc += 1;
+                },
+                .br => |target_pc| {
+                    pc = target_pc;
+                },
+                .br_if => |target_pc| {
+                    const condition = self.pop();
+
+                    if (condition.i32 != 0) {
+                        pc = target_pc;
+                    } else {
+                        pc += 1;
+                    }
+                },
+                .br_table => |table| {
+                    const i: usize = @intCast(self.pop().i32);
+
+                    if (i < table.label_pcs.len) {
+                        pc = table.label_pcs[i];
+                    } else {
+                        pc = table.default_pc;
+                    }
+                },
+                .@"return" => |arity| {
+                    const frame = try self.getCurrentFrame();
+
+                    if (frame.return_pc) |return_pc| {
+                        // Keep return values, drop locals for this frame
+                        if (arity == 0) {
+                            self.stack.items.len = frame.base_ptr;
+                        } else {
+                            const len = self.stack.items.len;
+                            const results_start = len - arity;
+                            @memmove(self.stack.items[frame.base_ptr .. frame.base_ptr + arity], self.stack.items[results_start..len]);
+                            self.stack.items.len = frame.base_ptr + arity;
+                        }
+
+                        pc = return_pc;
+                        self.call_stack.items.len -= 1;
+                    } else {
+                        return; // end execution
+                    }
                 },
                 .call => |call| {
                     try self.call_stack.append(self.allocator, Frame{
@@ -1517,47 +1784,6 @@ pub const Runtime = struct {
                         }
                     } else {
                         return error.UninitializedTableElement;
-                    }
-                },
-                .@"return" => |arity| {
-                    const frame = try self.getCurrentFrame();
-
-                    if (frame.return_pc) |return_pc| {
-                        // Keep return values, drop locals for this frame
-                        if (arity == 0) {
-                            self.stack.items.len = frame.base_ptr;
-                        } else {
-                            const len = self.stack.items.len;
-                            const results_start = len - arity;
-                            @memmove(self.stack.items[frame.base_ptr .. frame.base_ptr + arity], self.stack.items[results_start..len]);
-                            self.stack.items.len = frame.base_ptr + arity;
-                        }
-
-                        pc = return_pc;
-                        self.call_stack.items.len -= 1;
-                    } else {
-                        return; // end execution
-                    }
-                },
-                .br => |target_pc| {
-                    pc = target_pc;
-                },
-                .br_if => |target_pc| {
-                    const condition = self.pop();
-
-                    if (condition.i32 != 0) {
-                        pc = target_pc;
-                    } else {
-                        pc += 1;
-                    }
-                },
-                .br_table => |table| {
-                    const i: usize = @intCast(self.pop().i32);
-
-                    if (i < table.label_pcs.len) {
-                        pc = table.label_pcs[i];
-                    } else {
-                        pc = table.default_pc;
                     }
                 },
                 .drop => {
@@ -1619,6 +1845,18 @@ pub const Runtime = struct {
                     try self.push(.{ .i32 = n });
                     pc += 1;
                 },
+                .i64_const => |n| {
+                    try self.push(.{ .i64 = n });
+                    pc += 1;
+                },
+                .f32_const => |x| {
+                    try self.push(.{ .f32 = x });
+                    pc += 1;
+                },
+                .f64_const => |x| {
+                    try self.push(.{ .f64 = x });
+                    pc += 1;
+                },
                 .i32_eqz => {
                     const val = self.pop();
                     try self.pushBool(val.i32 == 0);
@@ -1629,19 +1867,72 @@ pub const Runtime = struct {
                     try self.pushBool(args[0].i32 == args[1].i32);
                     pc += 1;
                 },
-                .i32_and => {
+                .i32_ne => {
                     const args = self.popArgs(2);
-                    try self.push(.{ .i32 = args[0].i32 & args[1].i32 });
+                    try self.pushBool(args[0].i32 != args[1].i32);
                     pc += 1;
                 },
-                .i32_or => {
+                .i32_lt_s => {
                     const args = self.popArgs(2);
-                    try self.push(.{ .i32 = args[0].i32 | args[1].i32 });
+                    try self.pushBool(args[0].i32 < args[1].i32);
                     pc += 1;
                 },
-                .i32_xor => {
+                .i32_lt_u => {
                     const args = self.popArgs(2);
-                    try self.push(.{ .i32 = args[0].i32 ^ args[1].i32 });
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs < rhs);
+                    pc += 1;
+                },
+                .i32_gt_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 > args[1].i32);
+                    pc += 1;
+                },
+                .i32_gt_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs > rhs);
+                    pc += 1;
+                },
+                .i32_le_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 <= args[1].i32);
+                    pc += 1;
+                },
+                .i32_le_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs <= rhs);
+                    pc += 1;
+                },
+                .i32_ge_s => {
+                    const args = self.popArgs(2);
+                    try self.pushBool(args[0].i32 >= args[1].i32);
+                    pc += 1;
+                },
+                .i32_ge_u => {
+                    const args = self.popArgs(2);
+                    const lhs: u32 = @bitCast(args[0].i32);
+                    const rhs: u32 = @bitCast(args[1].i32);
+                    try self.pushBool(lhs >= rhs);
+                    pc += 1;
+                },
+                .i32_clz => {
+                    const val = self.pop().i32;
+                    try self.push(.{ .i32 = @clz(val) });
+                    pc += 1;
+                },
+                .i32_ctz => {
+                    const val = self.pop().i32;
+                    try self.push(.{ .i32 = @ctz(val) });
+                    pc += 1;
+                },
+                .i32_popcnt => {
+                    const val = self.pop().i32;
+                    try self.push(.{ .i32 = @popCount(val) });
                     pc += 1;
                 },
                 .i32_add => {
@@ -1659,18 +1950,6 @@ pub const Runtime = struct {
                     try self.push(.{ .i32 = args[0].i32 *% args[1].i32 });
                     pc += 1;
                 },
-                .i32_div_u => {
-                    const args = self.popArgs(2);
-                    const lhs: u32 = @bitCast(args[0].i32);
-                    const rhs: u32 = @bitCast(args[1].i32);
-
-                    if (rhs == 0) {
-                        return error.IntegerDivideByZero;
-                    }
-
-                    try self.push(.{ .i32 = @bitCast(lhs / rhs) });
-                    pc += 1;
-                },
                 .i32_div_s => {
                     const args = self.popArgs(2);
                     const lhs: i32 = args[0].i32;
@@ -1683,7 +1962,7 @@ pub const Runtime = struct {
                     try self.push(.{ .i32 = @divExact(lhs, rhs) });
                     pc += 1;
                 },
-                .i32_rem_u => {
+                .i32_div_u => {
                     const args = self.popArgs(2);
                     const lhs: u32 = @bitCast(args[0].i32);
                     const rhs: u32 = @bitCast(args[1].i32);
@@ -1692,7 +1971,7 @@ pub const Runtime = struct {
                         return error.IntegerDivideByZero;
                     }
 
-                    try self.push(.{ .i32 = @bitCast(@rem(lhs, rhs)) });
+                    try self.push(.{ .i32 = @bitCast(lhs / rhs) });
                     pc += 1;
                 },
                 .i32_rem_s => {
@@ -1707,12 +1986,39 @@ pub const Runtime = struct {
                     try self.push(.{ .i32 = @rem(lhs, rhs) });
                     pc += 1;
                 },
-                .i32_shr_u => {
+                .i32_rem_u => {
                     const args = self.popArgs(2);
                     const lhs: u32 = @bitCast(args[0].i32);
                     const rhs: u32 = @bitCast(args[1].i32);
+
+                    if (rhs == 0) {
+                        return error.IntegerDivideByZero;
+                    }
+
+                    try self.push(.{ .i32 = @bitCast(@rem(lhs, rhs)) });
+                    pc += 1;
+                },
+                .i32_and => {
+                    const args = self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 & args[1].i32 });
+                    pc += 1;
+                },
+                .i32_or => {
+                    const args = self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 | args[1].i32 });
+                    pc += 1;
+                },
+                .i32_xor => {
+                    const args = self.popArgs(2);
+                    try self.push(.{ .i32 = args[0].i32 ^ args[1].i32 });
+                    pc += 1;
+                },
+                .i32_shl => {
+                    const args = self.popArgs(2);
+                    const lhs = args[0].i32;
+                    const rhs: u32 = @bitCast(args[1].i32);
                     const shift_amount: u5 = @intCast(rhs);
-                    try self.push(.{ .i32 = @bitCast(lhs >> shift_amount) });
+                    try self.push(.{ .i32 = lhs << shift_amount });
                     pc += 1;
                 },
                 .i32_shr_s => {
@@ -1723,64 +2029,31 @@ pub const Runtime = struct {
                     try self.push(.{ .i32 = lhs >> shift_amount });
                     pc += 1;
                 },
-                .i32_le_u => {
+                .i32_shr_u => {
                     const args = self.popArgs(2);
                     const lhs: u32 = @bitCast(args[0].i32);
                     const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs <= rhs);
+                    const shift_amount: u5 = @intCast(rhs);
+                    try self.push(.{ .i32 = @bitCast(lhs >> shift_amount) });
                     pc += 1;
                 },
-                .i32_le_s => {
+                .i32_rotl => {
                     const args = self.popArgs(2);
-                    try self.pushBool(args[0].i32 <= args[1].i32);
+                    const val: u32 = @bitCast(args[0].i32);
+                    const shift = @as(u32, @bitCast(args[1].i32)) & 31;
+                    try self.push(.{ .i32 = @bitCast(std.math.rotl(u32, val, shift)) });
                     pc += 1;
                 },
-                .i32_lt_u => {
+                .i32_rotr => {
                     const args = self.popArgs(2);
-                    const lhs: u32 = @bitCast(args[0].i32);
-                    const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs < rhs);
+                    const val: u32 = @bitCast(args[0].i32);
+                    const shift = @as(u32, @bitCast(args[1].i32)) & 31;
+                    try self.push(.{ .i32 = @bitCast(std.math.rotr(u32, val, shift)) });
                     pc += 1;
                 },
-                .i32_lt_s => {
-                    const args = self.popArgs(2);
-                    try self.pushBool(args[0].i32 < args[1].i32);
-                    pc += 1;
-                },
-                .i32_gt_u => {
-                    const args = self.popArgs(2);
-                    const lhs: u32 = @bitCast(args[0].i32);
-                    const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs > rhs);
-                    pc += 1;
-                },
-                .i32_gt_s => {
-                    const args = self.popArgs(2);
-                    try self.pushBool(args[0].i32 > args[1].i32);
-                    pc += 1;
-                },
-                .i32_ge_u => {
-                    const args = self.popArgs(2);
-                    const lhs: u32 = @bitCast(args[0].i32);
-                    const rhs: u32 = @bitCast(args[1].i32);
-                    try self.pushBool(lhs >= rhs);
-                    pc += 1;
-                },
-                .i32_ge_s => {
-                    const args = self.popArgs(2);
-                    try self.pushBool(args[0].i32 >= args[1].i32);
-                    pc += 1;
-                },
-                .i64_const => |n| {
-                    try self.push(.{ .i64 = n });
-                    pc += 1;
-                },
-                .f32_const => |x| {
-                    try self.push(.{ .f32 = x });
-                    pc += 1;
-                },
-                .f64_const => |x| {
-                    try self.push(.{ .f64 = x });
+                .i32_wrap_i64 => {
+                    const val = self.pop();
+                    try self.push(.{ .i32 = @truncate(val.i64) });
                     pc += 1;
                 },
                 else => {
