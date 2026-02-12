@@ -1,8 +1,19 @@
 const std = @import("std");
+const types = @import("types.zig");
 
-pub const Token = union(enum) {
-    @"(",
-    @")",
+pub const TokenType = enum {
+    lparen,
+    rparen,
+    id,
+    keyword,
+    integer,
+    float,
+    string,
+};
+
+pub const Token = union(TokenType) {
+    lparen,
+    rparen,
     id: []const u8,
     keyword: []const u8,
     integer: IntegerLiteral,
@@ -11,8 +22,8 @@ pub const Token = union(enum) {
 
     pub fn format(self: Token, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
-            .@"(" => try writer.writeAll("("),
-            .@")" => try writer.writeAll(")"),
+            .lparen => try writer.writeAll("("),
+            .rparen => try writer.writeAll(")"),
             .id => |s| try writer.print("${s}", .{s}),
             .keyword => |s| try writer.writeAll(s),
             .integer => |int| {
@@ -255,11 +266,11 @@ pub const Lexer = struct {
         switch (char) {
             '(' => {
                 self.pos += 1;
-                return self.span(start, .@"(");
+                return self.span(start, .lparen);
             },
             ')' => {
                 self.pos += 1;
-                return self.span(start, .@")");
+                return self.span(start, .rparen);
             },
             '"' => {
                 self.pos += 1;
@@ -272,7 +283,7 @@ pub const Lexer = struct {
                     }
                     if (c == '\\') {
                         if (self.pos + 1 >= self.source.len) {
-                            return error.UnexpectedEndOfSource;
+                            return error.UnexpectedEOF;
                         }
 
                         self.pos += 2;
@@ -310,5 +321,221 @@ pub const Lexer = struct {
                 }
             },
         }
+    }
+};
+
+const ArrayList = std.ArrayList;
+
+const ModuleFieldType = enum {
+    type,
+    import,
+    func,
+    table,
+    memory,
+    global,
+    @"export",
+    start,
+    elem,
+    data,
+};
+
+pub const Index = union(enum) {
+    x: u32,
+    id: []const u8,
+};
+
+pub const Module = struct {
+    name: ?[]const u8,
+    ids: std.hash_map.StringHashMap(usize),
+    types: ArrayList(types.FuncType),
+
+    fn init(allocator: std.mem.Allocator, name: ?[]const u8) !Module {
+        return Module{
+            .name = name,
+            .ids = .init(allocator),
+            .types = .empty,
+        };
+    }
+
+    pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
+        self.ids.deinit();
+
+        for (self.types.items) |ty| {
+            ty.deinit(allocator);
+        }
+
+        self.types.deinit(allocator);
+    }
+};
+
+pub const Parser = struct {
+    lexer: Lexer,
+    current: ?Token,
+    allocator: std.mem.Allocator,
+
+    pub fn init(source: []const u8, allocator: std.mem.Allocator) !Parser {
+        var parser = Parser{
+            .lexer = Lexer.init(source),
+            .current = null,
+            .allocator = allocator,
+        };
+
+        if (try parser.lexer.next()) |t| {
+            parser.current = t.token;
+        }
+
+        return parser;
+    }
+
+    fn advance(self: *Parser) !void {
+        if (try self.lexer.next()) |t| {
+            std.debug.print("advance: {any}\n", .{t.token});
+            self.current = t.token;
+        } else {
+            self.current = null;
+        }
+    }
+
+    fn peek(self: *Parser) !Token {
+        return self.current orelse return error.UnexpectedEOF;
+    }
+
+    fn expect(self: *Parser, tt: TokenType) !Token {
+        const token = try self.peek();
+
+        if (std.meta.activeTag(token) != tt) {
+            std.debug.print("Expected token type: {any}, found: {any}\n", .{ tt, token });
+            return error.UnexpectedToken;
+        }
+
+        try self.advance();
+
+        return token;
+    }
+
+    fn expectKeyword(self: *Parser, kw: []const u8) !void {
+        const token = try self.peek();
+
+        switch (token) {
+            .keyword => |s| {
+                if (!std.mem.eql(u8, s, kw)) {
+                    std.debug.print("Expected keyword: {s}, found: {s}\n", .{ kw, s });
+                    return error.UnexpectedKeyword;
+                }
+            },
+            else => return error.ExpectedKeyword,
+        }
+
+        try self.advance();
+    }
+
+    fn optional(self: *Parser, tt: TokenType) !?Token {
+        if (self.current) |token| {
+            if (std.meta.activeTag(token) == tt) {
+                try self.advance();
+                return token;
+            }
+        }
+
+        return null;
+    }
+
+    fn optionalId(self: *Parser) !?[]const u8 {
+        if (try self.optional(.id)) |id| {
+            return id.id;
+        }
+
+        return null;
+    }
+
+    pub fn parseModule(self: *Parser) !Module {
+        _ = try self.expect(.lparen);
+        try self.expectKeyword("module");
+        const name = try self.optionalId();
+        var module = try Module.init(self.allocator, name);
+
+        while (try self.visitModuleField(&module)) {}
+
+        _ = try self.expect(.rparen);
+
+        return module;
+    }
+
+    fn visitModuleField(self: *Parser, module: *Module) !bool {
+        if (try self.optional(.lparen)) |_| {
+            const field_type = try self.expect(.keyword);
+
+            if (std.meta.stringToEnum(ModuleFieldType, field_type.keyword)) |ft| {
+                switch (ft) {
+                    .type => {
+                        try self.visitTypeField(module);
+                    },
+                    else => {
+                        return error.ModuleFieldNotSupportedYet;
+                    },
+                }
+            } else {
+                return error.UnknownModuleField;
+            }
+
+            _ = try self.expect(.rparen);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    fn parseValType(self: *Parser) !types.ValType {
+        const token = try self.expect(.keyword);
+        return std.meta.stringToEnum(types.ValType, token.keyword) orelse return error.UnknownValType;
+    }
+
+    fn parseFuncType(self: *Parser) !types.FuncType {
+        _ = try self.expect(.lparen);
+        try self.expectKeyword("func");
+
+        var params: ArrayList(types.ValType) = .empty;
+        var results: ArrayList(types.ValType) = .empty;
+
+        while (try self.optional(.lparen)) |_| {
+            const keyword = (try self.expect(.keyword)).keyword;
+
+            if (std.mem.eql(u8, keyword, "param")) {
+                if (results.items.len > 0) {
+                    // all params must be defined before any results.
+                    return error.InvalidFuncType;
+                }
+
+                _ = try self.optionalId();
+                const ty = try self.parseValType();
+                try params.append(self.allocator, ty);
+            } else if (std.mem.eql(u8, keyword, "result")) {
+                const ty = try self.parseValType();
+                try results.append(self.allocator, ty);
+            } else {
+                return error.InvalidFuncType;
+            }
+
+            _ = try self.expect(.rparen);
+        }
+
+        _ = try self.expect(.rparen);
+
+        return types.FuncType{
+            .params = try params.toOwnedSlice(self.allocator),
+            .results = try results.toOwnedSlice(self.allocator),
+        };
+    }
+
+    fn visitTypeField(self: *Parser, module: *Module) !void {
+        const id = try self.optionalId();
+        const func_ty = try self.parseFuncType();
+
+        if (id) |name| {
+            try module.ids.put(name, module.types.items.len);
+        }
+
+        try module.types.append(self.allocator, func_ty);
     }
 };

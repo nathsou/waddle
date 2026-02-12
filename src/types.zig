@@ -64,6 +64,11 @@ pub const FuncType = struct {
     pub fn eql(self: FuncType, other: FuncType) bool {
         return std.mem.eql(ValType, self.params, other.params) and std.mem.eql(ValType, self.results, other.results);
     }
+
+    pub fn deinit(self: *FuncType, allocator: std.mem.Allocator) void {
+        allocator.free(self.params);
+        allocator.free(self.results);
+    }
 };
 
 pub const Limits = struct {

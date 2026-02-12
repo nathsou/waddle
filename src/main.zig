@@ -1,5 +1,7 @@
 const std = @import("std");
 const waddle = @import("waddle");
+const parse = waddle.parse;
+const wat = waddle.wat;
 const builtin = @import("builtin");
 const runtime = waddle.runtime;
 const types = waddle.types;
@@ -55,7 +57,7 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 
     const wasm_path = args[wasm_path_idx.?];
-    var vm = try runtime.Runtime.from(arena.allocator(), wasm_path);
+    var vm = try createVM(arena.allocator(), wasm_path);
     defer vm.deinit();
 
     if (print_bytecode) {
@@ -80,5 +82,41 @@ fn run(allocator: std.mem.Allocator) !void {
         std.debug.print("\n", .{});
     } else {
         try vm.invokeStartFunc();
+    }
+}
+
+fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runtime {
+    var store = runtime.Store.init(allocator);
+
+    const file = try std.fs.cwd().openFile(module_path, .{});
+    defer file.close();
+    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+
+    if (std.ascii.endsWithIgnoreCase(module_path, ".wasm")) {
+        var parser = parse.Parser.init(allocator, bytes);
+        const module = try parser.readModule();
+        const module_inst = try store.instantiate(module, &.{});
+
+        var start_func_addr: ?runtime.FuncAddr = null;
+        if (module.start) |start_func_idx| {
+            const start_func_idx_usize = @as(usize, start_func_idx);
+
+            if (start_func_idx_usize >= module_inst.func_addrs.len) {
+                return error.InvalidStartFuncIndex;
+            }
+
+            start_func_addr = module_inst.func_addrs[start_func_idx_usize];
+        }
+
+        return try runtime.Runtime.init(allocator, store, module_inst, start_func_addr);
+    } else if (std.ascii.endsWithIgnoreCase(module_path, ".wat")) {
+        var parser = try wat.Parser.init(bytes, allocator);
+        const module = try parser.parseModule();
+
+        std.debug.print("{any}\n", .{module});
+
+        return error.WatNotSupportedYet;
+    } else {
+        return error.UnsupportedModuleFormat;
     }
 }
