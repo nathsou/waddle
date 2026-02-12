@@ -1,5 +1,4 @@
 const std = @import("std");
-const types = @import("types.zig");
 
 pub const Token = union(enum) {
     @"(",
@@ -18,14 +17,10 @@ pub const Token = union(enum) {
             .keyword => |s| try writer.writeAll(s),
             .integer => |int| {
                 if (int.is_hex) {
-                    if (int.is_signed) {
-                        try writer.print("0x{x}", .{int.value});
-                    } else {
-                        try writer.print("0x{x}", .{int.value});
-                    }
+                    try writer.print("0x{x}", .{int.value});
                 } else {
                     if (int.is_signed) {
-                        try writer.print("{d}", .{@as(i64, @bitCast(int.value))});
+                        try writer.print("-{d}", .{int.value});
                     } else {
                         try writer.print("{d}", .{int.value});
                     }
@@ -57,8 +52,6 @@ pub const FloatLiteral = struct {
     value: u64,
 };
 
-/// A lexer for WebAssembly Text Format (WAT).
-/// string slices stored in tokens point to the original source, so they are valid as long as the source is valid.
 pub const Lexer = struct {
     source: []const u8,
     pos: usize,
@@ -72,36 +65,31 @@ pub const Lexer = struct {
 
     fn advance(self: *Lexer) ?u8 {
         self.pos += 1;
-
         if (self.pos >= self.source.len) {
             return null;
         }
-
         return self.source[self.pos];
     }
 
     fn peek(self: *Lexer, offset: usize) ?u8 {
         const pos = self.pos + offset;
-
         if (pos >= self.source.len) {
             return null;
         }
-
         return self.source[pos];
     }
 
-    fn matches(self: *Lexer, s: []const u8, offset: usize) bool {
-        if (self.pos + offset + s.len > self.source.len) {
+    fn match(self: *Lexer, c: u8) bool {
+        if (self.pos >= self.source.len) return false;
+        return self.source[self.pos] == c;
+    }
+
+    fn matches(self: *Lexer, s: []const u8) bool {
+        if (self.pos + s.len > self.source.len) {
             return false;
         }
 
-        for (s, 0..) |c, i| {
-            if (self.source[self.pos + offset + i] != c) {
-                return false;
-            }
-        }
-
-        return true;
+        return std.mem.eql(u8, self.source[self.pos .. self.pos + s.len], s);
     }
 
     fn isIdChar(c: u8) bool {
@@ -113,168 +101,156 @@ pub const Lexer = struct {
         };
     }
 
-    fn isStringChar(c: u8) bool {
-        if (c >= 0x20 and c != 0x7F and c != '"' and c != '\\') {
-            return true;
-        }
-
-        // TODO: Support unicode characters
-        return switch (c) {
-            '\t', '\n', '\r', '"', '\'', '\\' => true,
-            else => false,
-        };
-    }
-
     fn isLineCommentChar(c: u8) bool {
         return c != '\n' and c != '\r';
     }
 
-    fn skipWhitespacesAndComments(self: *Lexer) !void {
+    fn skipWhitespacesAndComments(self: *Lexer) void {
         while (self.pos < self.source.len) {
             const char = self.source[self.pos];
-
             switch (char) {
                 ' ', '\n', '\r', '\t' => {
                     self.pos += 1;
                 },
                 ';' => {
-                    if (self.matches(";", 1)) {
-                        self.pos += 2; // Skip ";;"
-
-                        // line comment
-                        while (self.advance()) |c| {
-                            if (!isLineCommentChar(c)) {
-                                break;
-                            }
+                    if (self.matches(";;")) {
+                        self.pos += 2;
+                        while (self.pos < self.source.len) {
+                            if (!isLineCommentChar(self.source[self.pos])) break;
+                            self.pos += 1;
                         }
                     } else {
-                        break;
+                        return;
                     }
                 },
                 '(' => {
-                    if (self.matches(";", 1)) {
-                        // block comment
-                        self.pos += 2; // Skip "(;"
+                    if (self.matches("(;")) {
+                        self.pos += 2;
                         var depth: usize = 1;
-
-                        while (self.pos < self.source.len) {
-                            const c = self.source[self.pos];
-
-                            if (c == '(' and self.matches(";", 1)) {
+                        while (self.pos < self.source.len and depth > 0) {
+                            if (self.matches("(;")) {
                                 depth += 1;
                                 self.pos += 2;
-                            } else if (c == ';' and self.matches(")", 1)) {
+                            } else if (self.matches(";)")) {
                                 depth -= 1;
                                 self.pos += 2;
-
-                                if (depth == 0) {
-                                    break;
-                                }
                             } else {
-                                _ = self.advance();
-                            }
-                        }
-                    } else if (self.matches("@", 1)) {
-                        // annotation
-                        self.pos += 2; // Skip "(@"
-                        var depth: usize = 1;
-
-                        while (self.pos < self.source.len) {
-                            const c = self.source[self.pos];
-
-                            if (c == '(') {
-                                depth += 1;
                                 self.pos += 1;
-                            } else if (c == ')') {
-                                depth -= 1;
-                                self.pos += 1;
-
-                                if (depth == 0) {
-                                    break;
-                                }
-                            } else {
-                                _ = self.advance();
                             }
                         }
                     } else {
-                        break;
+                        return;
                     }
                 },
-                else => break,
+                else => return,
             }
         }
     }
 
-    fn parseDigit(c: u8, is_hex: bool) ?u8 {
-        if (is_hex) {
-            return switch (c) {
-                '0'...'9' => c - '0',
-                'a'...'f' => c - 'a' + 10,
-                'A'...'F' => c - 'A' + 10,
-                else => null,
-            };
-        } else {
-            if (c >= '0' and c <= '9') {
-                return c - '0';
-            } else {
-                return null;
-            }
-        }
+    fn tryParseInt(text: []const u8, is_hex: bool) ?u64 {
+        // parseInt handles underscores
+        return std.fmt.parseInt(u64, text, if (is_hex) 16 else 10) catch null;
     }
 
-    fn parseInteger(self: *Lexer, is_signed: bool, is_hex: bool) !IntegerLiteral {
-        var value: u64 = 0;
+    fn tryParseFloat(text: []const u8) ?f64 {
+        // parseFloat handles underscores
+        return std.fmt.parseFloat(f64, text) catch null;
+    }
 
-        while (self.advance()) |c| {
-            if (parseDigit(c, is_hex)) |digit| {
-                const res1 = @mulWithOverflow(value, @as(u64, if (is_hex) 16 else 10));
+    fn parseNumber(text: []const u8) ?Token {
+        if (text.len == 0) return null;
 
-                if (res1[1] == 1) {
-                    return error.IntegerOverflow;
-                }
+        var start: usize = 0;
+        var is_signed = false;
 
-                const res2 = @addWithOverflow(res1[0], digit);
+        if (text[0] == '+' or text[0] == '-') {
+            is_signed = text[0] == '-';
+            start = 1;
+            if (text.len == 1) return null;
+        }
 
-                if (res2[1] == 1) {
-                    return error.IntegerOverflow;
-                }
+        const remaining = text[start..];
 
-                value = res2[0];
-            } else {
+        if (std.mem.eql(u8, remaining, "inf")) {
+            const val = if (is_signed) -std.math.inf(f64) else std.math.inf(f64);
+            return Token{ .float = .{ .value = @bitCast(val) } };
+        }
+
+        if (std.mem.startsWith(u8, remaining, "nan")) {
+            // Standard IEEE 754 f64 Exponent Mask (Bits 52-62)
+            const exponent_bits: u64 = 0x7FF0000000000000;
+            // Standard IEEE 754 f64 Mantissa Mask (Bits 0-51)
+            const mantissa_mask: u64 = 0x000FFFFFFFFFFFFF;
+            // Canonical NaN has the MSB of the mantissa set (Quiet NaN)
+            const canon_nan_bits: u64 = 0x7FF8000000000000;
+
+            var bits: u64 = canon_nan_bits;
+
+            if (remaining.len > 3 and remaining[3] == ':') {
+                const payload_str = remaining[4..];
+                const is_payload_hex = std.mem.startsWith(u8, payload_str, "0x");
+                const num_part = if (is_payload_hex) payload_str[2..] else payload_str;
+
+                // If the payload integer is invalid, this entire token is not a number.
+                const payload = tryParseInt(num_part, is_payload_hex) orelse return null;
+
+                // When an explicit payload is provided, we use the bare exponent bits.
+                // The payload determines if it is Quiet (bit 51=1) or Signaling (bit 51=0).
+                bits = exponent_bits | (payload & mantissa_mask);
+            }
+
+            // Apply the sign bit if necessary (Bit 63)
+            if (is_signed) {
+                bits |= 0x8000000000000000;
+            }
+
+            return Token{ .float = .{ .value = bits } };
+        }
+
+        const is_hex = std.mem.startsWith(u8, remaining, "0x");
+        const num_start: usize = if (is_hex) 2 else 0;
+
+        if (num_start >= remaining.len) return null;
+
+        var is_float = false;
+        for (remaining[num_start..]) |c| {
+            if (c == '.' or c == 'p' or c == 'P' or c == 'e' or c == 'E') {
+                is_float = true;
                 break;
             }
         }
 
-        return IntegerLiteral{
-            .value = value,
-            .is_signed = is_signed,
-            .is_hex = is_hex,
-        };
+        if (is_float) {
+            if (tryParseFloat(remaining)) |val| {
+                const final = if (is_signed) -val else val;
+                return Token{ .float = .{ .value = @bitCast(final) } };
+            }
+        } else {
+            const num_part = remaining[num_start..];
+            if (tryParseInt(num_part, is_hex)) |val| {
+                return Token{ .integer = .{ .value = val, .is_signed = is_signed, .is_hex = is_hex } };
+            }
+        }
+
+        return null;
     }
 
     fn span(self: *Lexer, start: usize, token: Token) TokenSpan {
         return TokenSpan{
-            .span = Span{
-                .start = start,
-                .end = self.pos,
-            },
+            .span = Span{ .start = start, .end = self.pos },
             .token = token,
         };
     }
 
     pub fn next(self: *Lexer) !?TokenSpan {
-        if (self.pos >= self.source.len) {
-            return null;
-        }
-
-        try self.skipWhitespacesAndComments();
+        self.skipWhitespacesAndComments();
 
         if (self.pos >= self.source.len) {
             return null;
         }
 
-        const char = self.source[self.pos];
         const start = self.pos;
+        const char = self.source[self.pos];
 
         switch (char) {
             '(' => {
@@ -285,57 +261,53 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return self.span(start, .@")");
             },
-            '$', 'a'...'z' => {
-                const is_id = char == '$';
-
-                while (self.advance()) |c| {
-                    if (!isIdChar(c)) {
-                        break;
-                    }
-                }
-
-                if (is_id) {
-                    return self.span(start, .{ .id = self.source[start + 1 .. self.pos] });
-                } else {
-                    return self.span(start, .{ .keyword = self.source[start..self.pos] });
-                }
-            },
             '"' => {
-                var escaped = false;
+                self.pos += 1;
 
-                while (self.advance()) |c| {
-                    if (escaped) {
-                        escaped = false;
-                    } else if (c == '\\') {
-                        escaped = true;
-                    } else if (c == '"') {
-                        self.pos += 1; // Skip closing quote
+                while (self.pos < self.source.len) {
+                    const c = self.source[self.pos];
+                    if (c == '"') {
+                        self.pos += 1;
                         break;
                     }
+                    if (c == '\\') {
+                        if (self.pos + 1 >= self.source.len) {
+                            return error.UnexpectedEndOfSource;
+                        }
+
+                        self.pos += 2;
+                        continue;
+                    }
+
+                    if (c < 0x20) {
+                        return error.IllegalControlCharacter;
+                    }
+
+                    self.pos += 1;
                 }
 
                 return self.span(start, .{ .string = self.source[start + 1 .. self.pos - 1] });
             },
-            '-', '+', '0'...'9' => {
-                var is_signed = false;
-                var is_hex = false;
-
-                if (char == '-' or char == '+') {
-                    is_signed = char == '-';
-                    self.pos += 1; // Skip sign
-                }
-
-                if (self.matches("0x", 0)) {
-                    self.pos += 2; // Skip "0x"
-                    is_hex = true;
-                }
-
-                const int = try self.parseInteger(is_signed, is_hex);
-                return self.span(start, .{ .integer = int });
-            },
             else => {
-                std.debug.print("Unexpected character: '{c}' (code {d}) \n", .{ char, char });
-                return error.UnexpectedCharacter;
+                if (isIdChar(char)) {
+                    while (self.pos < self.source.len and isIdChar(self.source[self.pos])) {
+                        self.pos += 1;
+                    }
+
+                    const text = self.source[start..self.pos];
+
+                    if (text.len > 0 and text[0] == '$') {
+                        return self.span(start, .{ .id = text[1..] });
+                    }
+
+                    if (parseNumber(text)) |token| {
+                        return self.span(start, token);
+                    }
+
+                    return self.span(start, .{ .keyword = text });
+                } else {
+                    return error.UnexpectedCharacter;
+                }
             },
         }
     }

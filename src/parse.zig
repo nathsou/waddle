@@ -15,22 +15,21 @@ const types = @import("types.zig");
 ///     const module = try parser.parseModule();
 ///     // All allocations are freed when arena.deinit() is called
 pub const Parser = struct {
-    const Self = @This();
     bytes: []const u8,
     index: usize = 0,
     allocator: std.mem.Allocator,
 
     /// Initialize a new Parser.
     /// The allocator should typically be an ArenaAllocator for simple cleanup.
-    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Self {
-        return Self{
+    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Parser {
+        return Parser{
             .bytes = bytes,
             .allocator = allocator,
         };
     }
 
     // Reader interface (used in readUleb128)
-    pub fn readByte(self: *Self) !types.Byte {
+    pub fn readByte(self: *Parser) !types.Byte {
         if (self.index >= self.bytes.len) {
             return error.EndOfInput;
         }
@@ -41,7 +40,7 @@ pub const Parser = struct {
         return byte;
     }
 
-    pub fn peekByte(self: *Self) !u8 {
+    pub fn peekByte(self: *Parser) !u8 {
         if (self.index >= self.bytes.len) {
             return error.EndOfInput;
         }
@@ -49,27 +48,27 @@ pub const Parser = struct {
         return self.bytes[self.index];
     }
 
-    fn readUInt(self: *Self, comptime T: type) !T {
+    fn readUInt(self: *Parser, comptime T: type) !T {
         return std.leb.readUleb128(T, self);
     }
 
-    fn readSInt(self: *Self, comptime T: type) !T {
+    fn readSInt(self: *Parser, comptime T: type) !T {
         return std.leb.readIleb128(T, self);
     }
 
-    fn readU8(self: *Self) !u8 {
+    fn readU8(self: *Parser) !u8 {
         return self.readUInt(u8);
     }
 
-    fn readU16(self: *Self) !u16 {
+    fn readU16(self: *Parser) !u16 {
         return self.readUInt(u16);
     }
 
-    fn readU32(self: *Self) !u32 {
+    fn readU32(self: *Parser) !u32 {
         return self.readUInt(u32);
     }
 
-    fn readFixedU32(self: *Self) !u32 {
+    fn readFixedU32(self: *Parser) !u32 {
         if (self.index + 4 > self.bytes.len) {
             return error.EndOfInput;
         }
@@ -78,39 +77,39 @@ pub const Parser = struct {
         return val;
     }
 
-    fn readU64(self: *Self) !u64 {
+    fn readU64(self: *Parser) !u64 {
         return self.readUInt(u64);
     }
 
-    fn readI8(self: *Self) !i8 {
+    fn readI8(self: *Parser) !i8 {
         return self.readSInt(i8);
     }
 
-    fn readI16(self: *Self) !i16 {
+    fn readI16(self: *Parser) !i16 {
         return self.readSInt(i16);
     }
 
-    fn readI32(self: *Self) !i32 {
+    fn readI32(self: *Parser) !i32 {
         return self.readSInt(i32);
     }
 
-    fn readI64(self: *Self) !i64 {
+    fn readI64(self: *Parser) !i64 {
         return self.readSInt(i64);
     }
 
-    fn readF32(self: *Self) !f32 {
+    fn readF32(self: *Parser) !f32 {
         const val = std.mem.readInt(u32, self.bytes[self.index..][0..4], .little);
         self.index += 4;
         return @bitCast(val);
     }
 
-    fn readF64(self: *Self) !f64 {
+    fn readF64(self: *Parser) !f64 {
         const val = std.mem.readInt(u64, self.bytes[self.index..][0..8], .little);
         self.index += 8;
         return @bitCast(val);
     }
 
-    fn readVector(self: *Self, comptime T: type, decode_fn: *const fn (*Self) anyerror!T) ![]T {
+    fn readVector(self: *Parser, comptime T: type, decode_fn: *const fn (*Parser) anyerror!T) ![]T {
         const len = try self.readU32();
         const vec = try self.allocator.alloc(T, len);
         errdefer self.allocator.free(vec);
@@ -122,7 +121,7 @@ pub const Parser = struct {
         return vec;
     }
 
-    fn readName(self: *Self) !types.Name {
+    fn readName(self: *Parser) !types.Name {
         const name_len = try self.readU32();
 
         if (self.index + name_len > self.bytes.len) {
@@ -134,7 +133,7 @@ pub const Parser = struct {
         return bytes;
     }
 
-    fn readValType(self: *Self) !types.ValType {
+    fn readValType(self: *Parser) !types.ValType {
         const n = try self.readByte();
 
         return switch (n) {
@@ -146,7 +145,7 @@ pub const Parser = struct {
         };
     }
 
-    fn readBlockType(self: *Self) !types.BlockType {
+    fn readBlockType(self: *Parser) !types.BlockType {
         const n = try self.peekByte();
 
         if (n == 0x40) {
@@ -158,20 +157,20 @@ pub const Parser = struct {
         }
     }
 
-    fn readFuncType(self: *Self) !types.FuncType {
+    fn readFuncType(self: *Parser) !types.FuncType {
         const n = try self.readByte();
 
         if (n != 0x60) {
             return error.InvalidFuncType;
         }
 
-        const params = try self.readVector(types.ValType, Self.readValType);
-        const results = try self.readVector(types.ValType, Self.readValType);
+        const params = try self.readVector(types.ValType, readValType);
+        const results = try self.readVector(types.ValType, readValType);
 
         return .{ .params = params, .results = results };
     }
 
-    fn readLimits(self: *Self) !types.Limits {
+    fn readLimits(self: *Parser) !types.Limits {
         const flag = try self.readByte();
         const min = try self.readU32();
 
@@ -190,7 +189,7 @@ pub const Parser = struct {
         }
     }
 
-    fn readMemType(self: *Self) !types.MemType {
+    fn readMemType(self: *Parser) !types.MemType {
         const limits = try self.readLimits();
 
         if (limits.max) |max| {
@@ -202,7 +201,7 @@ pub const Parser = struct {
         return .{ .limits = limits };
     }
 
-    fn readTableType(self: *Self) !types.TableType {
+    fn readTableType(self: *Parser) !types.TableType {
         const elem_type_n = try self.readByte();
         const elem_type = switch (elem_type_n) {
             0x70 => .func_ref,
@@ -214,7 +213,7 @@ pub const Parser = struct {
         return .{ .elem_type = elem_type, .limits = limits };
     }
 
-    fn readGlobalType(self: *Self) !types.GlobalType {
+    fn readGlobalType(self: *Parser) !types.GlobalType {
         const val_type = try self.readValType();
         const mutable_n = try self.readByte();
         const mutable = switch (mutable_n) {
@@ -226,13 +225,13 @@ pub const Parser = struct {
         return .{ .val_type = val_type, .mutable = mutable };
     }
 
-    fn readGlobal(self: *Self) !types.Global {
+    fn readGlobal(self: *Parser) !types.Global {
         const type_ = try self.readGlobalType();
         const init_expr = try self.readExpr();
         return .{ .type = type_, .init = init_expr };
     }
 
-    fn readImport(self: *Self) !types.Import {
+    fn readImport(self: *Parser) !types.Import {
         const module_name = try self.readName();
         const field_name = try self.readName();
         const desc_type = try self.readByte();
@@ -251,7 +250,7 @@ pub const Parser = struct {
         };
     }
 
-    fn readExport(self: *Self) !types.Export {
+    fn readExport(self: *Parser) !types.Export {
         const name = try self.readName();
         const desc_type = try self.readByte();
         const export_desc: types.ExportDesc = switch (desc_type) {
@@ -268,10 +267,10 @@ pub const Parser = struct {
         };
     }
 
-    fn readElem(self: *Self) !types.Elem {
+    fn readElem(self: *Parser) !types.Elem {
         const table_idx = try self.readU32();
         const offset_expr = try self.readExpr();
-        const func_indices = try self.readVector(types.FuncIndex, Self.readU32);
+        const func_indices = try self.readVector(types.FuncIndex, readU32);
 
         return .{
             .table = table_idx,
@@ -280,16 +279,16 @@ pub const Parser = struct {
         };
     }
 
-    fn readLocals(self: *Self) !types.Locals {
+    fn readLocals(self: *Parser) !types.Locals {
         const count = try self.readU32();
         const val_type = try self.readValType();
         return .{ .count = count, .type = val_type };
     }
 
-    fn readCode(self: *Self) !types.Code {
+    fn readCode(self: *Parser) !types.Code {
         const body_size = try self.readU32();
         const body_end = self.index + @as(usize, body_size);
-        const locals = try self.readVector(types.Locals, Self.readLocals);
+        const locals = try self.readVector(types.Locals, readLocals);
         const expr = try self.readExpr();
 
         if (self.index != body_end) {
@@ -302,10 +301,10 @@ pub const Parser = struct {
         };
     }
 
-    fn readData(self: *Self) !types.Data {
+    fn readData(self: *Parser) !types.Data {
         const mem_idx = try self.readU32();
         const offset_expr = try self.readExpr();
-        const init_bytes = try self.readVector(types.Byte, Self.readU8);
+        const init_bytes = try self.readVector(types.Byte, readU8);
 
         return .{
             .mem = mem_idx,
@@ -322,7 +321,7 @@ pub const Parser = struct {
     const else_op_code = 0x05;
     const end_op_code = 0x0B;
 
-    fn readInstructionSequence(self: *Self, terminators: []const u8) anyerror!SequenceResult {
+    fn readInstructionSequence(self: *Parser, terminators: []const u8) anyerror!SequenceResult {
         var instructions = try std.ArrayList(types.Instr).initCapacity(self.allocator, 32);
         errdefer instructions.deinit(self.allocator);
 
@@ -342,13 +341,13 @@ pub const Parser = struct {
         }
     }
 
-    fn readMemArg(self: *Self) !types.MemoryInstrArg {
+    fn readMemArg(self: *Parser) !types.MemoryInstrArg {
         const alignment = try self.readU32();
         const offset = try self.readU32();
         return .{ .alignment = alignment, .offset = offset };
     }
 
-    fn readInstr(self: *Self) !types.Instr {
+    fn readInstr(self: *Parser) !types.Instr {
         const opcode = try self.readByte();
 
         return switch (opcode) {
@@ -394,7 +393,7 @@ pub const Parser = struct {
                 return .{ .br_if = label_idx };
             },
             0x0E => {
-                const labels = try self.readVector(types.LabelIndex, Self.readU32);
+                const labels = try self.readVector(types.LabelIndex, readU32);
                 const default_idx = try self.readU32();
                 return .{ .br_table = .{ .label_indices = labels, .default_idx = default_idx } };
             },
@@ -593,11 +592,11 @@ pub const Parser = struct {
         };
     }
 
-    fn readExpr(self: *Self) ![]types.Instr {
+    fn readExpr(self: *Parser) ![]types.Instr {
         return (try self.readInstructionSequence(&.{end_op_code})).instructions;
     }
 
-    fn readSectionHeader(self: *Self, expected_id: u8) !?u32 {
+    fn readSectionHeader(self: *Parser, expected_id: u8) !?u32 {
         const next_byte = self.peekByte() catch |err| {
             if (err == error.EndOfInput) return null;
             return err;
@@ -610,7 +609,7 @@ pub const Parser = struct {
         return null;
     }
 
-    fn readCustomSection(self: *Self, size: u32) !types.CustomSection {
+    fn readCustomSection(self: *Parser, size: u32) !types.CustomSection {
         const name = try self.readName();
         const content_size = size - @as(u32, @intCast(name.len));
         const content = self.bytes[self.index .. self.index + @as(usize, content_size)];
@@ -618,7 +617,7 @@ pub const Parser = struct {
         return .{ .name = name, .data = content };
     }
 
-    fn readCustomSections(self: *Self, container: *std.ArrayList(types.CustomSection)) !void {
+    fn readCustomSections(self: *Parser, container: *std.ArrayList(types.CustomSection)) !void {
         while (true) {
             const saved_index = self.index;
             const next_byte = self.peekByte() catch |err| {
@@ -639,62 +638,62 @@ pub const Parser = struct {
         }
     }
 
-    fn readTypeSection(self: *Self) ![]types.FuncType {
+    fn readTypeSection(self: *Parser) ![]types.FuncType {
         _ = try self.readSectionHeader(1) orelse return &.{};
-        return try self.readVector(types.FuncType, Self.readFuncType);
+        return try self.readVector(types.FuncType, readFuncType);
     }
 
-    fn readImportSection(self: *Self) ![]types.Import {
+    fn readImportSection(self: *Parser) ![]types.Import {
         _ = try self.readSectionHeader(2) orelse return &.{};
-        return try self.readVector(types.Import, Self.readImport);
+        return try self.readVector(types.Import, readImport);
     }
 
-    fn readFunctionSection(self: *Self) ![]types.FuncIndex {
+    fn readFunctionSection(self: *Parser) ![]types.FuncIndex {
         _ = try self.readSectionHeader(3) orelse return &.{};
-        return try self.readVector(types.FuncIndex, Self.readU32);
+        return try self.readVector(types.FuncIndex, readU32);
     }
 
-    fn readTableSection(self: *Self) ![]types.TableType {
+    fn readTableSection(self: *Parser) ![]types.TableType {
         _ = try self.readSectionHeader(4) orelse return &.{};
-        return try self.readVector(types.TableType, Self.readTableType);
+        return try self.readVector(types.TableType, readTableType);
     }
 
-    fn readMemorySection(self: *Self) ![]types.MemType {
+    fn readMemorySection(self: *Parser) ![]types.MemType {
         _ = try self.readSectionHeader(5) orelse return &.{};
-        return try self.readVector(types.MemType, Self.readMemType);
+        return try self.readVector(types.MemType, readMemType);
     }
 
-    fn readGlobalSection(self: *Self) ![]types.Global {
+    fn readGlobalSection(self: *Parser) ![]types.Global {
         _ = try self.readSectionHeader(6) orelse return &.{};
-        return try self.readVector(types.Global, Self.readGlobal);
+        return try self.readVector(types.Global, readGlobal);
     }
 
-    fn readExportSection(self: *Self) ![]types.Export {
+    fn readExportSection(self: *Parser) ![]types.Export {
         _ = try self.readSectionHeader(7) orelse return &.{};
-        return try self.readVector(types.Export, Self.readExport);
+        return try self.readVector(types.Export, readExport);
     }
 
-    fn readStartSection(self: *Self) !?types.FuncIndex {
+    fn readStartSection(self: *Parser) !?types.FuncIndex {
         _ = try self.readSectionHeader(8) orelse return null;
         return try self.readU32();
     }
 
-    fn readElementSection(self: *Self) ![]types.Elem {
+    fn readElementSection(self: *Parser) ![]types.Elem {
         _ = try self.readSectionHeader(9) orelse return &.{};
-        return try self.readVector(types.Elem, Self.readElem);
+        return try self.readVector(types.Elem, readElem);
     }
 
-    fn readCodeSection(self: *Self) ![]types.Code {
+    fn readCodeSection(self: *Parser) ![]types.Code {
         _ = try self.readSectionHeader(10) orelse return &.{};
-        return try self.readVector(types.Code, Self.readCode);
+        return try self.readVector(types.Code, readCode);
     }
 
-    fn readDataSection(self: *Self) ![]types.Data {
+    fn readDataSection(self: *Parser) ![]types.Data {
         _ = try self.readSectionHeader(11) orelse return &.{};
-        return try self.readVector(types.Data, Self.readData);
+        return try self.readVector(types.Data, readData);
     }
 
-    pub fn readModule(self: *Self) !types.Module {
+    pub fn readModule(self: *Parser) !types.Module {
         var custom_sections = try std.ArrayList(types.CustomSection).initCapacity(self.allocator, 0);
         defer custom_sections.deinit(self.allocator);
 
