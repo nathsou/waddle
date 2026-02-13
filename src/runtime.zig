@@ -1901,14 +1901,13 @@ pub const Runtime = struct {
 
         while (pc < self.bytecode.instrs.len) {
             const instr = self.bytecode.instrs[pc];
+            pc += 1;
 
             switch (instr) {
                 .@"unreachable" => {
                     return error.Unreachable;
                 },
-                .nop => {
-                    pc += 1;
-                },
+                .nop => {},
                 .br => |target_pc| {
                     pc = target_pc;
                 },
@@ -1917,8 +1916,6 @@ pub const Runtime = struct {
 
                     if (condition != 0) {
                         pc = target_pc;
-                    } else {
-                        pc += 1;
                     }
                 },
                 .br_table => |table| {
@@ -1953,7 +1950,7 @@ pub const Runtime = struct {
                 .call => |call| {
                     try self.call_stack.push(Frame{
                         .base_ptr = self.stack.top - call.arguments,
-                        .return_pc = pc + 1,
+                        .return_pc = pc,
                     });
 
                     pc = call.entry_pc;
@@ -1975,7 +1972,7 @@ pub const Runtime = struct {
                         if (self.bytecode.functions[func_addr]) |entry_pc| {
                             try self.call_stack.push(Frame{
                                 .base_ptr = self.stack.top - call.func_type.params.len,
-                                .return_pc = pc + 1,
+                                .return_pc = pc,
                             });
 
                             pc = entry_pc;
@@ -1988,241 +1985,196 @@ pub const Runtime = struct {
                 },
                 .drop => {
                     self.stack.top -= 1;
-                    pc += 1;
                 },
                 .select => {
                     const condition = self.pop(i32);
                     const a = try self.stack.popValue();
                     const b = try self.stack.popValue();
                     try self.stack.pushValue(if (condition != 0) a else b);
-                    pc += 1;
                 },
                 .local_get => |local_idx| {
                     const val = try self.getLocal(local_idx);
                     try self.stack.pushValue(val);
-                    pc += 1;
                 },
                 .local_set => |local_idx| {
                     const val = try self.stack.popValue();
                     try self.setLocal(local_idx, val);
-                    pc += 1;
                 },
                 .local_tee => |local_idx| {
                     const val = try self.peek();
                     try self.setLocal(local_idx, val);
-                    pc += 1;
                 },
                 .global_get => |global_inst| {
                     try self.stack.pushValue(global_inst.value);
-                    pc += 1;
                 },
                 .global_set => |global_inst| {
                     const val = self.popValue();
                     std.debug.assert(global_inst.mutable);
                     global_inst.value = val;
-                    pc += 1;
                 },
                 .i32_load => |memarg| {
                     const val = try self.memLoad(i32, memarg);
                     try self.push(.{ .i32 = val });
-                    pc += 1;
                 },
                 .i64_load => |memarg| {
                     const val = try self.memLoad(i64, memarg);
                     try self.push(.{ .i64 = val });
-                    pc += 1;
                 },
                 .i32_store => |memarg| {
                     const val = self.pop(i32);
                     try self.memStore(i32, memarg, val);
-                    pc += 1;
                 },
                 .i64_store => |memarg| {
                     const val = self.pop(i64);
                     try self.memStore(i64, memarg, val);
-                    pc += 1;
                 },
                 .i32_const => |n| {
                     try self.push(.{ .i32 = n });
-                    pc += 1;
                 },
                 .i64_const => |n| {
                     try self.push(.{ .i64 = n });
-                    pc += 1;
                 },
                 .f32_const => |x| {
                     try self.push(.{ .f32 = x });
-                    pc += 1;
                 },
                 .f64_const => |x| {
                     try self.push(.{ .f64 = x });
-                    pc += 1;
                 },
                 .i32_eqz => {
                     const val = self.pop(i32);
                     try self.pushBool(val == 0);
-                    pc += 1;
                 },
                 .i32_eq => {
                     const args = self.pop2Values(i32);
                     try self.pushBool(args[0] == args[1]);
-                    pc += 1;
                 },
                 .i32_ne => {
                     const args = self.pop2Values(i32);
                     try self.pushBool(args[0] != args[1]);
-                    pc += 1;
                 },
                 .i32_lt_s => {
                     const args = self.pop2Values(i32);
                     try self.pushBool(args[0] < args[1]);
-                    pc += 1;
                 },
                 .i32_lt_u => {
                     const args = self.pop2Values(i32);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs < rhs);
-                    pc += 1;
                 },
                 .i32_gt_s => {
                     const args = self.pop2Values(i32);
                     try self.pushBool(args[0] > args[1]);
-                    pc += 1;
                 },
                 .i32_gt_u => {
                     const args = self.pop2Values(i32);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs > rhs);
-                    pc += 1;
                 },
                 .i32_le_s => {
                     const args = self.pop2Values(i32);
                     try self.pushBool(args[0] <= args[1]);
-                    pc += 1;
                 },
                 .i32_le_u => {
                     const args = self.pop2Values(i32);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs <= rhs);
-                    pc += 1;
                 },
                 .i32_ge_s => {
                     const args = self.pop2Values(i32);
                     try self.pushBool(args[0] >= args[1]);
-                    pc += 1;
                 },
                 .i32_ge_u => {
                     const args = self.pop2Values(i32);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs >= rhs);
-                    pc += 1;
                 },
                 .i32_clz => {
                     const val = self.pop(i32);
                     try self.push(.{ .i32 = @clz(val) });
-                    pc += 1;
                 },
                 .i32_ctz => {
                     const val = self.pop(i32);
                     try self.push(.{ .i32 = @ctz(val) });
-                    pc += 1;
                 },
                 .i32_popcnt => {
                     const val = self.pop(i32);
                     try self.push(.{ .i32 = @popCount(val) });
-                    pc += 1;
                 },
                 .i32_add => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = args[0] +% args[1] });
-                    pc += 1;
                 },
                 .i32_sub => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = args[0] -% args[1] });
-                    pc += 1;
                 },
                 .i32_mul => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = args[0] *% args[1] });
-                    pc += 1;
                 },
                 .i32_div_s => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = try intDiv(i32, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i32_div_u => {
                     const args = self.pop2Values(i32);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.push(.{ .i32 = @bitCast(try intDiv(u32, lhs, rhs)) });
-                    pc += 1;
                 },
                 .i32_rem_s => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = try intRem(i32, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i32_rem_u => {
                     const args = self.pop2Values(i32);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.push(.{ .i32 = @bitCast(try intRem(u32, lhs, rhs)) });
-                    pc += 1;
                 },
                 .i32_and => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = args[0] & args[1] });
-                    pc += 1;
                 },
                 .i32_or => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = args[0] | args[1] });
-                    pc += 1;
                 },
                 .i32_xor => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = args[0] ^ args[1] });
-                    pc += 1;
                 },
                 .i32_shl => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = intShl(i32, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i32_shr_s => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = intShr(i32, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i32_shr_u => {
                     const args = self.pop2Values(i32);
                     try self.push(.{ .i32 = @bitCast(intShr(u32, @as(u32, @bitCast(args[0])), @as(u32, @bitCast(args[1])))) });
-                    pc += 1;
                 },
                 .i32_rotl => {
                     const args = self.pop2Values(i32);
                     const val: u32 = @bitCast(args[0]);
                     const shift = @as(u32, @bitCast(args[1])) & 31;
                     try self.push(.{ .i32 = @bitCast(std.math.rotl(u32, val, shift)) });
-                    pc += 1;
                 },
                 .i32_rotr => {
                     const args = self.pop2Values(i32);
                     const val: u32 = @bitCast(args[0]);
                     const shift = @as(u32, @bitCast(args[1])) & 31;
                     try self.push(.{ .i32 = @bitCast(std.math.rotr(u32, val, shift)) });
-                    pc += 1;
                 },
                 .i32_wrap_i64 => {
                     const val = self.pop(i64);
                     try self.push(.{ .i32 = @truncate(val) });
-                    pc += 1;
                 },
                 .call_host => |host_func| {
                     const arg_count = host_func.type.params.len;
@@ -2237,107 +2189,86 @@ pub const Runtime = struct {
                     for (result) |val| {
                         try self.push(val);
                     }
-                    pc += 1;
                 },
                 .f32_load => |memarg| {
                     const bits = try self.memLoad(u32, memarg);
                     try self.push(.{ .f32 = @bitCast(bits) });
-                    pc += 1;
                 },
                 .f64_load => |memarg| {
                     const bits = try self.memLoad(u64, memarg);
                     try self.push(.{ .f64 = @bitCast(bits) });
-                    pc += 1;
                 },
                 .i32_load8_s => |memarg| {
                     const val = try self.memLoad(i8, memarg);
                     try self.push(.{ .i32 = @intCast(val) });
-                    pc += 1;
                 },
                 .i32_load8_u => |memarg| {
                     const val = try self.memLoad(u8, memarg);
                     try self.push(.{ .i32 = @intCast(val) });
-                    pc += 1;
                 },
                 .i32_load16_s => |memarg| {
                     const val = try self.memLoad(i16, memarg);
                     try self.push(.{ .i32 = @intCast(val) });
-                    pc += 1;
                 },
                 .i32_load16_u => |memarg| {
                     const val = try self.memLoad(u16, memarg);
                     try self.push(.{ .i32 = @intCast(val) });
-                    pc += 1;
                 },
                 .i64_load8_s => |memarg| {
                     const val = try self.memLoad(i8, memarg);
                     try self.push(.{ .i64 = @intCast(val) });
-                    pc += 1;
                 },
                 .i64_load8_u => |memarg| {
                     const val = try self.memLoad(u8, memarg);
                     try self.push(.{ .i64 = @intCast(val) });
-                    pc += 1;
                 },
                 .i64_load16_s => |memarg| {
                     const val = try self.memLoad(i16, memarg);
                     try self.push(.{ .i64 = @intCast(val) });
-                    pc += 1;
                 },
                 .i64_load16_u => |memarg| {
                     const val = try self.memLoad(u16, memarg);
                     try self.push(.{ .i64 = @intCast(val) });
-                    pc += 1;
                 },
                 .i64_load32_s => |memarg| {
                     const val = try self.memLoad(i32, memarg);
                     try self.push(.{ .i64 = @intCast(val) });
-                    pc += 1;
                 },
                 .i64_load32_u => |memarg| {
                     const val = try self.memLoad(u32, memarg);
                     try self.push(.{ .i64 = @intCast(val) });
-                    pc += 1;
                 },
                 .f32_store => |memarg| {
                     const val = self.pop(f32);
                     try self.memStore(u32, memarg, @bitCast(val));
-                    pc += 1;
                 },
                 .f64_store => |memarg| {
                     const val = self.pop(f64);
                     try self.memStore(u64, memarg, @bitCast(val));
-                    pc += 1;
                 },
                 .i32_store8 => |memarg| {
                     const val = self.pop(i32);
                     try self.memStore(u8, memarg, @truncate(@as(u32, @bitCast(val))));
-                    pc += 1;
                 },
                 .i32_store16 => |memarg| {
                     const val = self.pop(i32);
                     try self.memStore(u16, memarg, @truncate(@as(u32, @bitCast(val))));
-                    pc += 1;
                 },
                 .i64_store8 => |memarg| {
                     const val = self.pop(i64);
                     try self.memStore(u8, memarg, @truncate(@as(u64, @bitCast(val))));
-                    pc += 1;
                 },
                 .i64_store16 => |memarg| {
                     const val = self.pop(i64);
                     try self.memStore(u16, memarg, @truncate(@as(u64, @bitCast(val))));
-                    pc += 1;
                 },
                 .i64_store32 => |memarg| {
                     const val = self.pop(i64);
                     try self.memStore(u32, memarg, @truncate(@as(u64, @bitCast(val))));
-                    pc += 1;
                 },
                 .memory_size => |mem_inst| {
                     const size: i32 = @intCast(mem_inst.data.len / page_size);
                     try self.push(.{ .i32 = size });
-                    pc += 1;
                 },
                 .memory_grow => |mem_inst| {
                     const n: u32 = @bitCast(self.pop(i32));
@@ -2361,478 +2292,384 @@ pub const Runtime = struct {
                     }
 
                     try self.push(.{ .i32 = result });
-                    pc += 1;
                 },
                 .i64_eqz => {
                     const val = self.pop(i64);
                     try self.pushBool(val == 0);
-                    pc += 1;
                 },
                 .i64_eq => {
                     const args = self.pop2Values(i64);
                     try self.pushBool(args[0] == args[1]);
-                    pc += 1;
                 },
                 .i64_ne => {
                     const args = self.pop2Values(i64);
                     try self.pushBool(args[0] != args[1]);
-                    pc += 1;
                 },
                 .i64_lt_s => {
                     const args = self.pop2Values(i64);
                     try self.pushBool(args[0] < args[1]);
-                    pc += 1;
                 },
                 .i64_lt_u => {
                     const args = self.pop2Values(i64);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs < rhs);
-                    pc += 1;
                 },
                 .i64_gt_s => {
                     const args = self.pop2Values(i64);
                     try self.pushBool(args[0] > args[1]);
-                    pc += 1;
                 },
                 .i64_gt_u => {
                     const args = self.pop2Values(i64);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs > rhs);
-                    pc += 1;
                 },
                 .i64_le_s => {
                     const args = self.pop2Values(i64);
                     try self.pushBool(args[0] <= args[1]);
-                    pc += 1;
                 },
                 .i64_le_u => {
                     const args = self.pop2Values(i64);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs <= rhs);
-                    pc += 1;
                 },
                 .i64_ge_s => {
                     const args = self.pop2Values(i64);
                     try self.pushBool(args[0] >= args[1]);
-                    pc += 1;
                 },
                 .i64_ge_u => {
                     const args = self.pop2Values(i64);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs >= rhs);
-                    pc += 1;
                 },
                 .f32_eq => {
                     const args = self.pop2Values(f32);
                     try self.pushBool(args[0] == args[1]);
-                    pc += 1;
                 },
                 .f32_ne => {
                     const args = self.pop2Values(f32);
                     try self.pushBool(args[0] != args[1]);
-                    pc += 1;
                 },
                 .f32_lt => {
                     const args = self.pop2Values(f32);
                     try self.pushBool(args[0] < args[1]);
-                    pc += 1;
                 },
                 .f32_gt => {
                     const args = self.pop2Values(f32);
                     try self.pushBool(args[0] > args[1]);
-                    pc += 1;
                 },
                 .f32_le => {
                     const args = self.pop2Values(f32);
                     try self.pushBool(args[0] <= args[1]);
-                    pc += 1;
                 },
                 .f32_ge => {
                     const args = self.pop2Values(f32);
                     try self.pushBool(args[0] >= args[1]);
-                    pc += 1;
                 },
                 .f64_eq => {
                     const args = self.pop2Values(f64);
                     try self.pushBool(args[0] == args[1]);
-                    pc += 1;
                 },
                 .f64_ne => {
                     const args = self.pop2Values(f64);
                     try self.pushBool(args[0] != args[1]);
-                    pc += 1;
                 },
                 .f64_lt => {
                     const args = self.pop2Values(f64);
                     try self.pushBool(args[0] < args[1]);
-                    pc += 1;
                 },
                 .f64_gt => {
                     const args = self.pop2Values(f64);
                     try self.pushBool(args[0] > args[1]);
-                    pc += 1;
                 },
                 .f64_le => {
                     const args = self.pop2Values(f64);
                     try self.pushBool(args[0] <= args[1]);
-                    pc += 1;
                 },
                 .f64_ge => {
                     const args = self.pop2Values(f64);
                     try self.pushBool(args[0] >= args[1]);
-                    pc += 1;
                 },
                 .i64_clz => {
                     const val = self.pop(i64);
                     try self.push(.{ .i64 = @clz(val) });
-                    pc += 1;
                 },
                 .i64_ctz => {
                     const val = self.pop(i64);
                     try self.push(.{ .i64 = @ctz(val) });
-                    pc += 1;
                 },
                 .i64_popcnt => {
                     const val = self.pop(i64);
                     try self.push(.{ .i64 = @popCount(val) });
-                    pc += 1;
                 },
                 .i64_add => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = args[0] +% args[1] });
-                    pc += 1;
                 },
                 .i64_sub => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = args[0] -% args[1] });
-                    pc += 1;
                 },
                 .i64_mul => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = args[0] *% args[1] });
-                    pc += 1;
                 },
                 .i64_div_s => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = try intDiv(i64, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i64_div_u => {
                     const args = self.pop2Values(i64);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.push(.{ .i64 = @bitCast(try intDiv(u64, lhs, rhs)) });
-                    pc += 1;
                 },
                 .i64_rem_s => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = try intRem(i64, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i64_rem_u => {
                     const args = self.pop2Values(i64);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.push(.{ .i64 = @bitCast(try intRem(u64, lhs, rhs)) });
-                    pc += 1;
                 },
                 .i64_and => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = args[0] & args[1] });
-                    pc += 1;
                 },
                 .i64_or => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = args[0] | args[1] });
-                    pc += 1;
                 },
                 .i64_xor => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = args[0] ^ args[1] });
-                    pc += 1;
                 },
                 .i64_shl => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = intShl(i64, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i64_shr_s => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = intShr(i64, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i64_shr_u => {
                     const args = self.pop2Values(i64);
                     try self.push(.{ .i64 = @bitCast(intShr(u64, @as(u64, @bitCast(args[0])), @as(u64, @bitCast(args[1])))) });
-                    pc += 1;
                 },
                 .i64_rotl => {
                     const args = self.pop2Values(i64);
                     const val: u64 = @bitCast(args[0]);
                     const shift = @as(u64, @bitCast(args[1])) & 63;
                     try self.push(.{ .i64 = @bitCast(std.math.rotl(u64, val, shift)) });
-                    pc += 1;
                 },
                 .i64_rotr => {
                     const args = self.pop2Values(i64);
                     const val: u64 = @bitCast(args[0]);
                     const shift = @as(u64, @bitCast(args[1])) & 63;
                     try self.push(.{ .i64 = @bitCast(std.math.rotr(u64, val, shift)) });
-                    pc += 1;
                 },
                 .f32_abs => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = @abs(val) });
-                    pc += 1;
                 },
                 .f32_neg => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = -val });
-                    pc += 1;
                 },
                 .f32_ceil => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = @ceil(val) });
-                    pc += 1;
                 },
                 .f32_floor => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = @floor(val) });
-                    pc += 1;
                 },
                 .f32_trunc => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = @trunc(val) });
-                    pc += 1;
                 },
                 .f32_nearest => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = @round(val) });
-                    pc += 1;
                 },
                 .f32_sqrt => {
                     const val = self.pop(f32);
                     try self.push(.{ .f32 = @sqrt(val) });
-                    pc += 1;
                 },
                 .f32_add => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = args[0] + args[1] });
-                    pc += 1;
                 },
                 .f32_sub => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = args[0] - args[1] });
-                    pc += 1;
                 },
                 .f32_mul => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = args[0] * args[1] });
-                    pc += 1;
                 },
                 .f32_div => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = args[0] / args[1] });
-                    pc += 1;
                 },
                 .f32_min => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = @min(args[0], args[1]) });
-                    pc += 1;
                 },
                 .f32_max => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = @max(args[0], args[1]) });
-                    pc += 1;
                 },
                 .f32_copysign => {
                     const args = self.pop2Values(f32);
                     try self.push(.{ .f32 = floatCopysign(f32, args[0], args[1]) });
-                    pc += 1;
                 },
                 .f64_abs => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = @abs(val) });
-                    pc += 1;
                 },
                 .f64_neg => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = -val });
-                    pc += 1;
                 },
                 .f64_ceil => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = @ceil(val) });
-                    pc += 1;
                 },
                 .f64_floor => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = @floor(val) });
-                    pc += 1;
                 },
                 .f64_trunc => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = @trunc(val) });
-                    pc += 1;
                 },
                 .f64_nearest => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = @round(val) });
-                    pc += 1;
                 },
                 .f64_sqrt => {
                     const val = self.pop(f64);
                     try self.push(.{ .f64 = @sqrt(val) });
-                    pc += 1;
                 },
                 .f64_add => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = args[0] + args[1] });
-                    pc += 1;
                 },
                 .f64_sub => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = args[0] - args[1] });
-                    pc += 1;
                 },
                 .f64_mul => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = args[0] * args[1] });
-                    pc += 1;
                 },
                 .f64_div => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = args[0] / args[1] });
-                    pc += 1;
                 },
                 .f64_min => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = @min(args[0], args[1]) });
-                    pc += 1;
                 },
                 .f64_max => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = @max(args[0], args[1]) });
-                    pc += 1;
                 },
                 .f64_copysign => {
                     const args = self.pop2Values(f64);
                     try self.push(.{ .f64 = floatCopysign(f64, args[0], args[1]) });
-                    pc += 1;
                 },
                 .i32_trunc_f32_s => {
                     try self.push(.{ .i32 = try truncFloat(i32, f32, self.pop(f32)) });
-                    pc += 1;
                 },
                 .i32_trunc_f32_u => {
                     try self.push(.{ .i32 = @bitCast(try truncFloat(u32, f32, self.pop(f32))) });
-                    pc += 1;
                 },
                 .i32_trunc_f64_s => {
                     try self.push(.{ .i32 = try truncFloat(i32, f64, self.pop(f64)) });
-                    pc += 1;
                 },
                 .i32_trunc_f64_u => {
                     try self.push(.{ .i32 = @bitCast(try truncFloat(u32, f64, self.pop(f64))) });
-                    pc += 1;
                 },
                 .i64_extend_i32_s => {
                     try self.push(.{ .i64 = extendInt(.signed, self.pop(i32)) });
-                    pc += 1;
                 },
                 .i64_extend_i32_u => {
                     try self.push(.{ .i64 = extendInt(.unsigned, self.pop(i32)) });
-                    pc += 1;
                 },
                 .i64_trunc_f32_s => {
                     try self.push(.{ .i64 = try truncFloat(i64, f32, self.pop(f32)) });
-                    pc += 1;
                 },
                 .i64_trunc_f32_u => {
                     try self.push(.{ .i64 = @bitCast(try truncFloat(u64, f32, self.pop(f32))) });
-                    pc += 1;
                 },
                 .i64_trunc_f64_s => {
                     try self.push(.{ .i64 = try truncFloat(i64, f64, self.pop(f64)) });
-                    pc += 1;
                 },
                 .i64_trunc_f64_u => {
                     try self.push(.{ .i64 = @bitCast(try truncFloat(u64, f64, self.pop(f64))) });
-                    pc += 1;
                 },
                 .f32_convert_i32_s => {
                     const v = self.pop(i32);
                     try self.push(.{ .f32 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f32_convert_i32_u => {
                     const v: u32 = @bitCast(self.pop(i32));
                     try self.push(.{ .f32 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f32_convert_i64_s => {
                     const v = self.pop(i64);
                     try self.push(.{ .f32 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f32_convert_i64_u => {
                     const v: u64 = @bitCast(self.pop(i64));
                     try self.push(.{ .f32 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f64_convert_i32_s => {
                     const v = self.pop(i32);
                     try self.push(.{ .f64 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f64_convert_i32_u => {
                     const v: u32 = @bitCast(self.pop(i32));
                     try self.push(.{ .f64 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f64_convert_i64_s => {
                     const v = self.pop(i64);
                     try self.push(.{ .f64 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f64_convert_i64_u => {
                     const v: u64 = @bitCast(self.pop(i64));
                     try self.push(.{ .f64 = @floatFromInt(v) });
-                    pc += 1;
                 },
                 .f32_demote_f64 => {
                     const v = self.pop(f64);
                     try self.push(.{ .f32 = @floatCast(v) });
-                    pc += 1;
                 },
                 .f64_promote_f32 => {
                     const v = self.pop(f32);
                     try self.push(.{ .f64 = @floatCast(v) });
-                    pc += 1;
                 },
                 .i32_reinterpret_f32 => {
                     const v = self.pop(f32);
                     try self.push(.{ .i32 = @bitCast(v) });
-                    pc += 1;
                 },
                 .i64_reinterpret_f64 => {
                     const v = self.pop(f64);
                     try self.push(.{ .i64 = @bitCast(v) });
-                    pc += 1;
                 },
                 .f32_reinterpret_i32 => {
                     const v = self.pop(i32);
                     try self.push(.{ .f32 = @bitCast(v) });
-                    pc += 1;
                 },
                 .f64_reinterpret_i64 => {
                     const v = self.pop(i64);
                     try self.push(.{ .f64 = @bitCast(v) });
-                    pc += 1;
                 },
             }
         }
