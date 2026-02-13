@@ -1492,15 +1492,45 @@ const Frame = struct {
     return_pc: ?usize,
 };
 
-const initial_stack_capacity: usize = 256;
-const initial_call_stack_capacity: usize = 256;
+fn FixedSizeStack(comptime T: type, Size: comptime_int) type {
+    return struct {
+        const Self = @This();
+        items: [Size]T,
+        top: usize,
+
+        fn init() Self {
+            return Self{
+                .items = undefined,
+                .top = 0,
+            };
+        }
+
+        fn push(self: *Self, val: T) !void {
+            if (self.top >= Size) {
+                return error.StackOverflow;
+            }
+
+            self.items[self.top] = val;
+            self.top += 1;
+        }
+
+        fn pop(self: *Self) !T {
+            if (self.top == 0) {
+                return error.StackUnderflow;
+            }
+
+            self.top -= 1;
+            return self.items[self.top];
+        }
+    };
+}
 
 pub const Runtime = struct {
     allocator: Allocator,
     store: Store,
     bytecode: Bytecode,
-    stack: ArrayList(Value),
-    call_stack: ArrayList(Frame),
+    stack: FixedSizeStack(Value, 16384),
+    call_stack: FixedSizeStack(Frame, 16384),
     module: *ModuleInstance,
     start_func_addr: ?FuncAddr,
 
@@ -1512,17 +1542,15 @@ pub const Runtime = struct {
             .allocator = allocator,
             .store = store,
             .bytecode = try lowering.lower(),
-            .stack = try ArrayList(Value).initCapacity(allocator, initial_stack_capacity),
-            .call_stack = try ArrayList(Frame).initCapacity(allocator, initial_call_stack_capacity),
+            .stack = .init(),
+            .call_stack = .init(),
             .start_func_addr = start_func_addr,
             .module = module,
         };
     }
 
     pub fn deinit(self: *Runtime) void {
-        self.stack.deinit(self.allocator);
         self.bytecode.deinit(self.allocator);
-        self.call_stack.deinit(self.allocator);
         self.module.deinit(self.allocator);
         self.allocator.destroy(self.module);
         self.store.deinit();
@@ -1551,11 +1579,11 @@ pub const Runtime = struct {
         const func_inst = self.store.funcs.items[func_addr];
         const func_type = func_inst.getType();
 
-        if (self.stack.items.len < func_type.params.len) {
+        if (self.stack.top < func_type.params.len) {
             return error.InvalidArgumentCount;
         }
 
-        const args_start = self.stack.items.len - func_type.params.len;
+        const args_start = self.stack.top - func_type.params.len;
 
         for (func_type.params, 0..) |param_type, i| {
             if (self.stack.items[args_start + i].getType() != param_type) {
@@ -1569,7 +1597,7 @@ pub const Runtime = struct {
 
                 // Locals are initialized by bytecode instructions emitted during lowering
                 // Parameters are already on the stack at base_ptr
-                try self.call_stack.append(self.allocator, Frame{
+                try self.call_stack.push(Frame{
                     .base_ptr = base_ptr,
                     .return_pc = null,
                 });
@@ -1581,7 +1609,8 @@ pub const Runtime = struct {
                         result = self.popArgs(wasm_func.type.results.len);
                     }
 
-                    self.stack.shrinkRetainingCapacity(base_ptr);
+                    self.stack.top = base_ptr;
+
                     return result;
                 } else {
                     return error.FunctionNotFound;
@@ -1590,49 +1619,46 @@ pub const Runtime = struct {
             .host => |host_func| {
                 const args = self.stack.items[args_start..];
                 const res = try host_func.code(args);
-                self.stack.items.len = args_start;
+                self.stack.top = args_start;
                 return res;
             },
         }
     }
 
-    fn push(self: *Runtime, val: Value) !void {
-        try self.stack.append(self.allocator, val);
+    inline fn push(self: *Runtime, val: Value) !void {
+        try self.stack.push(val);
     }
 
-    fn pushBool(self: *Runtime, b: bool) !void {
+    inline fn pushBool(self: *Runtime, b: bool) !void {
         try self.push(.{ .i32 = if (b) 1 else 0 });
     }
 
     fn popArgs(self: *Runtime, n: usize) []Value {
-        std.debug.assert(self.stack.items.len >= n);
-        const len = self.stack.items.len;
+        std.debug.assert(self.stack.top >= n);
+        const len = self.stack.top;
         const slice = self.stack.items[len - n .. len];
-        self.stack.items.len -= n;
+        self.stack.top -= n;
         return slice;
     }
 
-    fn pop(self: *Runtime) Value {
-        std.debug.assert(self.stack.items.len > 0);
-        const val = self.stack.items[self.stack.items.len - 1];
-        self.stack.items.len -= 1;
-        return val;
+    inline fn pop(self: *Runtime) Value {
+        return self.stack.pop() catch unreachable;
     }
 
     fn peek(self: *Runtime) !Value {
-        if (self.stack.items.len > 0) {
-            return self.stack.items[self.stack.items.len - 1];
+        if (self.stack.top > 0) {
+            return self.stack.items[self.stack.top - 1];
         } else {
             return error.ValueStackUnderflow;
         }
     }
 
     fn getCurrentFrame(self: *Runtime) !*Frame {
-        if (self.call_stack.items.len == 0) {
+        if (self.call_stack.top == 0) {
             return error.CallStackUnderflow;
         }
 
-        return &self.call_stack.items[self.call_stack.items.len - 1];
+        return &self.call_stack.items[self.call_stack.top - 1];
     }
 
     fn getLocal(self: *Runtime, idx: usize) !Value {
@@ -1770,23 +1796,23 @@ pub const Runtime = struct {
                     if (frame.return_pc) |return_pc| {
                         // Keep return values, drop locals for this frame
                         if (arity == 0) {
-                            self.stack.items.len = frame.base_ptr;
+                            self.stack.top = frame.base_ptr;
                         } else {
-                            const len = self.stack.items.len;
+                            const len = self.stack.top;
                             const results_start = len - arity;
                             @memmove(self.stack.items[frame.base_ptr .. frame.base_ptr + arity], self.stack.items[results_start..len]);
-                            self.stack.items.len = frame.base_ptr + arity;
+                            self.stack.top = frame.base_ptr + arity;
                         }
 
                         pc = return_pc;
-                        self.call_stack.items.len -= 1;
+                        self.call_stack.top -= 1;
                     } else {
                         return; // end execution
                     }
                 },
                 .call => |call| {
-                    try self.call_stack.append(self.allocator, Frame{
-                        .base_ptr = self.stack.items.len - call.arguments,
+                    try self.call_stack.push(Frame{
+                        .base_ptr = self.stack.top - call.arguments,
                         .return_pc = pc + 1,
                     });
 
@@ -1807,8 +1833,8 @@ pub const Runtime = struct {
                         }
 
                         if (self.bytecode.functions[func_addr]) |entry_pc| {
-                            try self.call_stack.append(self.allocator, Frame{
-                                .base_ptr = self.stack.items.len - call.func_type.params.len,
+                            try self.call_stack.push(Frame{
+                                .base_ptr = self.stack.top - call.func_type.params.len,
                                 .return_pc = pc + 1,
                             });
 
@@ -1821,7 +1847,7 @@ pub const Runtime = struct {
                     }
                 },
                 .drop => {
-                    self.stack.items.len -= 1;
+                    self.stack.top -= 1;
                     pc += 1;
                 },
                 .select => {

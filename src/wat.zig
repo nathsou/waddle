@@ -904,35 +904,35 @@ pub const Parser = struct {
             const field_kw = try self.expectKeyword();
 
             if (eql(field_kw, "type")) {
-                // Already processed in preScan; just skip past the (func ...) typeexpr.
-                _ = try self.optionalId();
-                _ = try self.parseFuncType(); // Discard; already in module_types
+                // Already processed in preScan
+                try self.skipParens(1);
+                continue;
             } else if (eql(field_kw, "import")) {
-                const imp = try self.visitImportField();
+                const imp = try self.parseImportField();
                 try mod_imports.append(self.allocator, imp);
             } else if (eql(field_kw, "func")) {
-                const result = try self.visitFuncField();
+                const result = try self.parseFuncField();
                 try mod_functions.append(self.allocator, result.type_idx);
                 try mod_codes.append(self.allocator, result.code);
             } else if (eql(field_kw, "table")) {
-                const tt = try self.visitTableField();
+                const tt = try self.parseTableField();
                 try mod_tables.append(self.allocator, tt);
             } else if (eql(field_kw, "memory")) {
-                const mt = try self.visitMemField();
+                const mt = try self.parseMemField();
                 try mod_memories.append(self.allocator, mt);
             } else if (eql(field_kw, "global")) {
-                const g = try self.visitGlobalField();
+                const g = try self.parseGlobalField();
                 try mod_globals.append(self.allocator, g);
             } else if (eql(field_kw, "export")) {
-                const ex = try self.visitExportField();
+                const ex = try self.parseExportField();
                 try mod_exports.append(self.allocator, ex);
             } else if (eql(field_kw, "start")) {
                 mod_start = try self.resolveFunc();
             } else if (eql(field_kw, "elem")) {
-                const el = try self.visitElemField();
+                const el = try self.parseElemField();
                 try mod_elems.append(self.allocator, el);
             } else if (eql(field_kw, "data")) {
-                const d = try self.visitDataField();
+                const d = try self.parseDataField();
                 try mod_datas.append(self.allocator, d);
             } else {
                 return error.UnknownModuleField;
@@ -959,12 +959,12 @@ pub const Parser = struct {
         };
     }
 
-    fn visitTypeField(self: *Parser) !types.FuncType {
+    fn parseTypeField(self: *Parser) !types.FuncType {
         _ = try self.optionalId(); // optional type name (already collected in pre-scan)
         return try self.parseFuncType();
     }
 
-    fn visitImportField(self: *Parser) !types.Import {
+    fn parseImportField(self: *Parser) !types.Import {
         const mod = try self.expectString();
         const name = try self.expectString();
         const desc = try self.parseImportDesc();
@@ -1003,7 +1003,7 @@ pub const Parser = struct {
         code: types.Code,
     };
 
-    fn visitFuncField(self: *Parser) !FuncResult {
+    fn parseFuncField(self: *Parser) !FuncResult {
         _ = try self.optionalId(); // func name (already collected)
 
         // Reset per-function state
@@ -1057,24 +1057,24 @@ pub const Parser = struct {
         };
     }
 
-    fn visitTableField(self: *Parser) !types.TableType {
+    fn parseTableField(self: *Parser) !types.TableType {
         _ = try self.optionalId();
         return try self.parseTableType();
     }
 
-    fn visitMemField(self: *Parser) !types.MemType {
+    fn parseMemField(self: *Parser) !types.MemType {
         _ = try self.optionalId();
         return try self.parseMemType();
     }
 
-    fn visitGlobalField(self: *Parser) !types.Global {
+    fn parseGlobalField(self: *Parser) !types.Global {
         _ = try self.optionalId();
         const gt = try self.parseGlobalType();
         const init_expr = try self.parseExpr();
         return .{ .type = gt, .init = init_expr };
     }
 
-    fn visitExportField(self: *Parser) !types.Export {
+    fn parseExportField(self: *Parser) !types.Export {
         const name = try self.expectString();
         _ = try self.expect(.lparen);
         const desc_kw = try self.expectKeyword();
@@ -1096,7 +1096,7 @@ pub const Parser = struct {
         return .{ .name = name, .desc = desc };
     }
 
-    fn visitElemField(self: *Parser) !types.Elem {
+    fn parseElemField(self: *Parser) !types.Elem {
         // (elem tableidx? (offset expr) funcidx*)
         // tableidx is optional, defaults to 0
         var table_idx: u32 = 0;
@@ -1140,7 +1140,7 @@ pub const Parser = struct {
         };
     }
 
-    fn visitDataField(self: *Parser) !types.Data {
+    fn parseDataField(self: *Parser) !types.Data {
         // (data memidx? (offset expr) datastring)
         var mem_idx: u32 = 0;
 
