@@ -24,6 +24,7 @@ pub const FlatInstr = union(enum) {
     // Control instructions
     @"unreachable",
     nop,
+    sentinel,
     br: PC,
     br_if: PC,
     br_table: BranchTableArg,
@@ -31,6 +32,27 @@ pub const FlatInstr = union(enum) {
     call: struct { entry_pc: PC, arguments: usize },
     call_indirect: struct { func_type: types.FuncType, table: *const TableInstance },
     call_host: *const HostFunc,
+
+    // Super instructions
+    super_i32_eqz_br_if: PC,
+    super_i32_eq_br_if: PC,
+    super_local_get_local_get: struct { lhs: LocalIndex, rhs: LocalIndex },
+    super_local_get_local_get_i32_add: struct { lhs: LocalIndex, rhs: LocalIndex },
+    super_local_get_local_get_i32_mul: struct { lhs: LocalIndex, rhs: LocalIndex },
+    super_local_get_i32_const_i32_add: struct { local: LocalIndex, imm: i32 },
+    super_local_add_i32_const_set: struct { local: LocalIndex, imm: i32 },
+    super_local_sub_i32_const_set: struct { local: LocalIndex, imm: i32 },
+    super_local_get_i32_const_i32_eq_br_if: struct { local: LocalIndex, imm: i32, target: PC },
+    super_local_get_i32_const_i32_ge_u_br_if: struct { local: LocalIndex, imm: i32, target: PC },
+    super_local_get_i32_const_i32_le_u_br_if: struct { local: LocalIndex, imm: i32, target: PC },
+    super_i32_const_local_set: struct { imm: i32, local: LocalIndex },
+    super_i64_const_local_set: struct { imm: i64, local: LocalIndex },
+    super_f32_const_local_set: struct { imm: f32, local: LocalIndex },
+    super_f64_const_local_set: struct { imm: f64, local: LocalIndex },
+    super_i32_const_return: i32,
+    super_i64_const_return: i64,
+    super_f32_const_return: f32,
+    super_f64_const_return: f64,
 
     // Parametric instructions
     drop,
@@ -204,6 +226,7 @@ pub const FlatInstr = union(enum) {
             // Control instructions
             .@"unreachable" => try writer.writeAll("unreachable"),
             .nop => try writer.writeAll("nop"),
+            .sentinel => try writer.writeAll("placeholder"),
             .br => |target| try writer.print("br {d}", .{target}),
             .br_if => |target| try writer.print("br_if {d}", .{target}),
             .br_table => |arg| {
@@ -218,6 +241,27 @@ pub const FlatInstr = union(enum) {
             .call => |arg| try writer.print("call pc={d} args={d}", .{ arg.entry_pc, arg.arguments }),
             .call_indirect => try writer.writeAll("call_indirect"),
             .call_host => try writer.writeAll("call_host"),
+
+            // Super instructions
+            .super_i32_eqz_br_if => |target| try writer.print("super.i32.eqz.br_if {d}", .{target}),
+            .super_i32_eq_br_if => |target| try writer.print("super.i32.eq.br_if {d}", .{target}),
+            .super_local_get_local_get => |arg| try writer.print("super.local.get.get {d} {d}", .{ arg.lhs, arg.rhs }),
+            .super_local_get_local_get_i32_add => |arg| try writer.print("super.local.get.get.i32.add {d} {d}", .{ arg.lhs, arg.rhs }),
+            .super_local_get_local_get_i32_mul => |arg| try writer.print("super.local.get.get.i32.mul {d} {d}", .{ arg.lhs, arg.rhs }),
+            .super_local_get_i32_const_i32_add => |arg| try writer.print("super.local.get.i32.const.i32.add {d} {d}", .{ arg.local, arg.imm }),
+            .super_local_add_i32_const_set => |arg| try writer.print("super.local.add.i32.const.set {d} {d}", .{ arg.local, arg.imm }),
+            .super_local_sub_i32_const_set => |arg| try writer.print("super.local.sub.i32.const.set {d} {d}", .{ arg.local, arg.imm }),
+            .super_local_get_i32_const_i32_eq_br_if => |arg| try writer.print("super.local.get.i32.const.i32.eq.br_if {d} {d} -> {d}", .{ arg.local, arg.imm, arg.target }),
+            .super_local_get_i32_const_i32_ge_u_br_if => |arg| try writer.print("super.local.get.i32.const.i32.ge_u.br_if {d} {d} -> {d}", .{ arg.local, arg.imm, arg.target }),
+            .super_local_get_i32_const_i32_le_u_br_if => |arg| try writer.print("super.local.get.i32.const.i32.le_u.br_if {d} {d} -> {d}", .{ arg.local, arg.imm, arg.target }),
+            .super_i32_const_local_set => |arg| try writer.print("super.i32.const.local.set {d} {d}", .{ arg.imm, arg.local }),
+            .super_i64_const_local_set => |arg| try writer.print("super.i64.const.local.set {d} {d}", .{ arg.imm, arg.local }),
+            .super_f32_const_local_set => |arg| try writer.print("super.f32.const.local.set {d} {d}", .{ arg.imm, arg.local }),
+            .super_f64_const_local_set => |arg| try writer.print("super.f64.const.local.set {d} {d}", .{ arg.imm, arg.local }),
+            .super_i32_const_return => |imm| try writer.print("super.i32.const.return {d}", .{imm}),
+            .super_i64_const_return => |imm| try writer.print("super.i64.const.return {d}", .{imm}),
+            .super_f32_const_return => |imm| try writer.print("super.f32.const.return {d}", .{imm}),
+            .super_f64_const_return => |imm| try writer.print("super.f64.const.return {d}", .{imm}),
 
             // Parametric instructions
             .drop => try writer.writeAll("drop"),
@@ -550,6 +594,9 @@ const BytecodeLowering = struct {
             }
         }
 
+        try self.detectSuperInstructions();
+        try self.moveSentinelsToTailAndTrim();
+
         var function_pc_mapping = try self.allocator.alloc(?PC, self.store.funcs.items.len);
         @memset(function_pc_mapping, null);
 
@@ -563,6 +610,380 @@ const BytecodeLowering = struct {
             .instrs = instrs,
             .functions = function_pc_mapping,
         };
+    }
+
+    fn moveSentinelsToTailAndTrim(self: *BytecodeLowering) !void {
+        if (self.flat.items.len == 0) return;
+
+        const old_len = self.flat.items.len;
+
+        const remapPc = struct {
+            fn countNonSentinelsBefore(instrs: []const FlatInstr, limit: PC) PC {
+                var count: PC = 0;
+                var i: usize = 0;
+
+                while (i < limit) : (i += 1) {
+                    if (instrs[i] != .sentinel) {
+                        count += 1;
+                    }
+                }
+
+                return count;
+            }
+
+            fn countNonSentinels(instrs: []const FlatInstr) PC {
+                return countNonSentinelsBefore(instrs, instrs.len);
+            }
+
+            fn resolve(instrs: []const FlatInstr, old_pc: PC) PC {
+                std.debug.assert(old_pc <= instrs.len);
+
+                var pc = old_pc;
+                while (pc < instrs.len and instrs[pc] == .sentinel) : (pc += 1) {}
+
+                if (pc == instrs.len) {
+                    return countNonSentinels(instrs);
+                }
+
+                return countNonSentinelsBefore(instrs, pc);
+            }
+        }.resolve;
+
+        // Rewrite all PC-based targets against the pre-compaction layout
+        const original_instrs = self.flat.items;
+        for (self.flat.items) |*instr| {
+            switch (instr.*) {
+                .br => |*target| {
+                    target.* = remapPc(original_instrs, target.*);
+                },
+                .br_if => |*target| {
+                    target.* = remapPc(original_instrs, target.*);
+                },
+                .br_table => |*arg| {
+                    for (arg.label_pcs) |*label_pc| {
+                        label_pc.* = remapPc(original_instrs, label_pc.*);
+                    }
+
+                    arg.default_pc = remapPc(original_instrs, arg.default_pc);
+                },
+                .call => |*arg| {
+                    arg.entry_pc = remapPc(original_instrs, arg.entry_pc);
+                },
+                .super_i32_eqz_br_if => |*target| {
+                    target.* = remapPc(original_instrs, target.*);
+                },
+                .super_i32_eq_br_if => |*target| {
+                    target.* = remapPc(original_instrs, target.*);
+                },
+                .super_local_get_i32_const_i32_eq_br_if => |*arg| {
+                    arg.target = remapPc(original_instrs, arg.target);
+                },
+                .super_local_get_i32_const_i32_ge_u_br_if => |*arg| {
+                    arg.target = remapPc(original_instrs, arg.target);
+                },
+                .super_local_get_i32_const_i32_le_u_br_if => |*arg| {
+                    arg.target = remapPc(original_instrs, arg.target);
+                },
+                else => {},
+            }
+        }
+
+        for (self.func_labels) |*label| {
+            label.entry = remapPc(original_instrs, label.entry);
+        }
+
+        // Stable in-place compaction: keep non-sentinel instructions in order,
+        // then shrink logical length to trim all sentinels from execution.
+        var write: usize = 0;
+        for (0..old_len) |read| {
+            const instr = self.flat.items[read];
+            if (instr != .sentinel) {
+                if (write != read) {
+                    self.flat.items[write] = instr;
+                }
+
+                write += 1;
+            }
+        }
+
+        self.flat.items.len = write;
+    }
+
+    fn detectSuperInstructions(self: *BytecodeLowering) !void {
+        if (self.flat.items.len < 2) return;
+
+        // List of branch/function-entry targets. We never fuse away an
+        // instruction at one of these PCs (except pattern start) to avoid
+        // changing externally reachable control-flow entry points.
+        var target_pcs: ArrayList(PC) = .empty;
+        defer target_pcs.deinit(self.allocator);
+
+        for (self.func_labels) |func_label| {
+            if (func_label.entry < self.flat.items.len) {
+                try self.appendTargetPcUnique(&target_pcs, func_label.entry);
+            }
+        }
+
+        for (self.flat.items) |instr| {
+            switch (instr) {
+                .br => |target| if (target < self.flat.items.len) {
+                    try self.appendTargetPcUnique(&target_pcs, target);
+                },
+                .br_if => |target| if (target < self.flat.items.len) {
+                    try self.appendTargetPcUnique(&target_pcs, target);
+                },
+                .br_table => |arg| {
+                    for (arg.label_pcs) |target| {
+                        if (target < self.flat.items.len) {
+                            try self.appendTargetPcUnique(&target_pcs, target);
+                        }
+                    }
+
+                    if (arg.default_pc < self.flat.items.len) {
+                        try self.appendTargetPcUnique(&target_pcs, arg.default_pc);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var i: usize = 0;
+        while (i < self.flat.items.len) : (i += 1) {
+            if (self.matchTagPattern(i, &.{ .i32_eqz, .br_if }, target_pcs.items)) {
+                const target = self.flat.items[i + 1].br_if;
+                self.flat.items[i] = .{ .super_i32_eqz_br_if = target };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .i32_const, .local_set }, target_pcs.items)) {
+                const imm = self.flat.items[i].i32_const;
+                const local = self.flat.items[i + 1].local_set;
+                self.flat.items[i] = .{ .super_i32_const_local_set = .{ .imm = imm, .local = local } };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .i64_const, .local_set }, target_pcs.items)) {
+                const imm = self.flat.items[i].i64_const;
+                const local = self.flat.items[i + 1].local_set;
+                self.flat.items[i] = .{ .super_i64_const_local_set = .{ .imm = imm, .local = local } };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .f32_const, .local_set }, target_pcs.items)) {
+                const imm = self.flat.items[i].f32_const;
+                const local = self.flat.items[i + 1].local_set;
+                self.flat.items[i] = .{ .super_f32_const_local_set = .{ .imm = imm, .local = local } };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .f64_const, .local_set }, target_pcs.items)) {
+                const imm = self.flat.items[i].f64_const;
+                const local = self.flat.items[i + 1].local_set;
+                self.flat.items[i] = .{ .super_f64_const_local_set = .{ .imm = imm, .local = local } };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .i32_const, .ret }, target_pcs.items) and self.flat.items[i + 1].@"return" == 1) {
+                const imm = self.flat.items[i].i32_const;
+                self.flat.items[i] = .{ .super_i32_const_return = imm };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .i64_const, .ret }, target_pcs.items) and self.flat.items[i + 1].@"return" == 1) {
+                const imm = self.flat.items[i].i64_const;
+                self.flat.items[i] = .{ .super_i64_const_return = imm };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .f32_const, .ret }, target_pcs.items) and self.flat.items[i + 1].@"return" == 1) {
+                const imm = self.flat.items[i].f32_const;
+                self.flat.items[i] = .{ .super_f32_const_return = imm };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .f64_const, .ret }, target_pcs.items) and self.flat.items[i + 1].@"return" == 1) {
+                const imm = self.flat.items[i].f64_const;
+                self.flat.items[i] = .{ .super_f64_const_return = imm };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .i32_eq, .br_if }, target_pcs.items)) {
+                const target = self.flat.items[i + 1].br_if;
+                self.flat.items[i] = .{ .super_i32_eq_br_if = target };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .local_get, .i32_add }, target_pcs.items)) {
+                const lhs = self.flat.items[i].local_get;
+                const rhs = self.flat.items[i + 1].local_get;
+                self.flat.items[i] = .{ .super_local_get_local_get_i32_add = .{ .lhs = lhs, .rhs = rhs } };
+                self.flat.items[i + 1] = .sentinel;
+                self.flat.items[i + 2] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .local_get, .i32_mul }, target_pcs.items)) {
+                const lhs = self.flat.items[i].local_get;
+                const rhs = self.flat.items[i + 1].local_get;
+                self.flat.items[i] = .{ .super_local_get_local_get_i32_mul = .{ .lhs = lhs, .rhs = rhs } };
+                self.flat.items[i + 1] = .sentinel;
+                self.flat.items[i + 2] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .i32_const, .i32_add }, target_pcs.items)) {
+                const lhs = self.flat.items[i].local_get;
+                const imm = self.flat.items[i + 1].i32_const;
+                self.flat.items[i] = .{ .super_local_get_i32_const_i32_add = .{ .local = lhs, .imm = imm } };
+                self.flat.items[i + 1] = .sentinel;
+                self.flat.items[i + 2] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .local_get }, target_pcs.items)) {
+                const lhs = self.flat.items[i].local_get;
+                const rhs = self.flat.items[i + 1].local_get;
+                self.flat.items[i] = .{ .super_local_get_local_get = .{ .lhs = lhs, .rhs = rhs } };
+                self.flat.items[i + 1] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .i32_const, .i32_add, .local_set }, target_pcs.items)) {
+                const local = self.flat.items[i].local_get;
+                const set_local = self.flat.items[i + 3].local_set;
+                if (local == set_local) {
+                    const imm = self.flat.items[i + 1].i32_const;
+                    self.flat.items[i] = .{ .super_local_add_i32_const_set = .{ .local = local, .imm = imm } };
+                    self.flat.items[i + 1] = .sentinel;
+                    self.flat.items[i + 2] = .sentinel;
+                    self.flat.items[i + 3] = .sentinel;
+                    continue;
+                }
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .i32_const, .i32_sub, .local_set }, target_pcs.items)) {
+                const local = self.flat.items[i].local_get;
+                const set_local = self.flat.items[i + 3].local_set;
+                if (local == set_local) {
+                    const imm = self.flat.items[i + 1].i32_const;
+                    self.flat.items[i] = .{ .super_local_sub_i32_const_set = .{ .local = local, .imm = imm } };
+                    self.flat.items[i + 1] = .sentinel;
+                    self.flat.items[i + 2] = .sentinel;
+                    self.flat.items[i + 3] = .sentinel;
+                    continue;
+                }
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .i32_const, .i32_eq, .br_if }, target_pcs.items)) {
+                const local = self.flat.items[i].local_get;
+                const imm = self.flat.items[i + 1].i32_const;
+                const target = self.flat.items[i + 3].br_if;
+                self.flat.items[i] = .{ .super_local_get_i32_const_i32_eq_br_if = .{ .local = local, .imm = imm, .target = target } };
+                self.flat.items[i + 1] = .sentinel;
+                self.flat.items[i + 2] = .sentinel;
+                self.flat.items[i + 3] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .i32_const, .i32_ge_u, .br_if }, target_pcs.items)) {
+                const local = self.flat.items[i].local_get;
+                const imm = self.flat.items[i + 1].i32_const;
+                const target = self.flat.items[i + 3].br_if;
+                self.flat.items[i] = .{ .super_local_get_i32_const_i32_ge_u_br_if = .{ .local = local, .imm = imm, .target = target } };
+                self.flat.items[i + 1] = .sentinel;
+                self.flat.items[i + 2] = .sentinel;
+                self.flat.items[i + 3] = .sentinel;
+                continue;
+            }
+
+            if (self.matchTagPattern(i, &.{ .local_get, .i32_const, .i32_le_u, .br_if }, target_pcs.items)) {
+                const local = self.flat.items[i].local_get;
+                const imm = self.flat.items[i + 1].i32_const;
+                const target = self.flat.items[i + 3].br_if;
+                self.flat.items[i] = .{ .super_local_get_i32_const_i32_le_u_br_if = .{ .local = local, .imm = imm, .target = target } };
+                self.flat.items[i + 1] = .sentinel;
+                self.flat.items[i + 2] = .sentinel;
+                self.flat.items[i + 3] = .sentinel;
+                continue;
+            }
+        }
+    }
+
+    fn appendTargetPcUnique(self: *BytecodeLowering, target_pcs: *ArrayList(PC), pc: PC) !void {
+        for (target_pcs.items) |existing| {
+            if (existing == pc) return;
+        }
+
+        try target_pcs.append(self.allocator, pc);
+    }
+
+    const InstrTag = enum {
+        other,
+        i32_eqz,
+        i32_eq,
+        i32_add,
+        i32_sub,
+        i32_mul,
+        i32_ge_u,
+        i32_le_u,
+        i32_const,
+        i64_const,
+        f32_const,
+        f64_const,
+        local_get,
+        local_set,
+        br_if,
+        ret,
+    };
+
+    fn tagOf(instr: FlatInstr) InstrTag {
+        return switch (instr) {
+            .i32_eqz => .i32_eqz,
+            .i32_eq => .i32_eq,
+            .i32_add => .i32_add,
+            .i32_sub => .i32_sub,
+            .i32_mul => .i32_mul,
+            .i32_ge_u => .i32_ge_u,
+            .i32_le_u => .i32_le_u,
+            .i32_const => .i32_const,
+            .i64_const => .i64_const,
+            .f32_const => .f32_const,
+            .f64_const => .f64_const,
+            .local_get => .local_get,
+            .local_set => .local_set,
+            .br_if => .br_if,
+            .@"return" => .ret,
+            else => .other,
+        };
+    }
+
+    fn matchTagPattern(self: *const BytecodeLowering, start: usize, tags: []const InstrTag, target_pcs: []const PC) bool {
+        if (start + tags.len > self.flat.items.len) return false;
+
+        for (tags, 0..) |tag, offset| {
+            if (offset > 0 and isTargetPc(target_pcs, start + offset)) return false;
+            if (tagOf(self.flat.items[start + offset]) != tag) return false;
+        }
+
+        return true;
+    }
+
+    fn isTargetPc(target_pcs: []const PC, pc: PC) bool {
+        for (target_pcs) |target| {
+            if (target == pc) return true;
+        }
+
+        return false;
     }
 
     fn lowerFunc(self: *BytecodeLowering, func: *const WasmFunc, func_index: usize) !void {
@@ -1815,6 +2236,23 @@ pub const Runtime = struct {
         self.stack.setValue(frame.base_ptr + idx, val);
     }
 
+    fn superConstReturn(self: *Runtime, comptime T: type, imm: T, pc: *usize) !bool {
+        try self.push(T, imm);
+        const frame = try self.getCurrentFrame();
+
+        if (frame.return_pc) |return_pc| {
+            const len = self.stack.top;
+            const results_start = len - 1;
+            @memmove(self.stack.values[frame.base_ptr .. frame.base_ptr + 1], self.stack.values[results_start..len]);
+            self.stack.top = frame.base_ptr + 1;
+            pc.* = return_pc;
+            self.call_stack.top -= 1;
+            return false;
+        }
+
+        return true;
+    }
+
     fn intDiv(comptime T: type, lhs: T, rhs: T) !T {
         if (rhs == 0) {
             return error.IntegerDivideByZero;
@@ -1912,6 +2350,7 @@ pub const Runtime = struct {
                     return error.Unreachable;
                 },
                 .nop => {},
+                .sentinel => unreachable,
                 .br => |target_pc| {
                     pc = target_pc;
                 },
@@ -2000,6 +2439,90 @@ pub const Runtime = struct {
                     } else {
                         return error.UninitializedTableElement;
                     }
+                },
+                .super_i32_eqz_br_if => |target_pc| {
+                    const condition = self.pop(i32);
+                    if (condition == 0) {
+                        pc = target_pc;
+                    }
+                },
+                .super_i32_eq_br_if => |target_pc| {
+                    const args = self.pop2Values(i32);
+                    if (args[0] == args[1]) {
+                        pc = target_pc;
+                    }
+                },
+                .super_local_get_local_get => |arg| {
+                    const lhs = try self.getLocal(arg.lhs);
+                    const rhs = try self.getLocal(arg.rhs);
+                    try self.stack.pushValue(lhs);
+                    try self.stack.pushValue(rhs);
+                },
+                .super_local_get_local_get_i32_add => |arg| {
+                    const lhs = (try self.getLocal(arg.lhs)).i32;
+                    const rhs = (try self.getLocal(arg.rhs)).i32;
+                    try self.push(i32, lhs +% rhs);
+                },
+                .super_local_get_local_get_i32_mul => |arg| {
+                    const lhs = (try self.getLocal(arg.lhs)).i32;
+                    const rhs = (try self.getLocal(arg.rhs)).i32;
+                    try self.push(i32, lhs *% rhs);
+                },
+                .super_local_get_i32_const_i32_add => |arg| {
+                    const lhs = (try self.getLocal(arg.local)).i32;
+                    try self.push(i32, lhs +% arg.imm);
+                },
+                .super_local_add_i32_const_set => |arg| {
+                    const lhs = (try self.getLocal(arg.local)).i32;
+                    try self.setLocal(arg.local, .{ .i32 = lhs +% arg.imm });
+                },
+                .super_local_sub_i32_const_set => |arg| {
+                    const lhs = (try self.getLocal(arg.local)).i32;
+                    try self.setLocal(arg.local, .{ .i32 = lhs -% arg.imm });
+                },
+                .super_local_get_i32_const_i32_eq_br_if => |arg| {
+                    const lhs = (try self.getLocal(arg.local)).i32;
+                    if (lhs == arg.imm) {
+                        pc = arg.target;
+                    }
+                },
+                .super_local_get_i32_const_i32_ge_u_br_if => |arg| {
+                    const lhs: u32 = @bitCast((try self.getLocal(arg.local)).i32);
+                    const rhs: u32 = @bitCast(arg.imm);
+                    if (lhs >= rhs) {
+                        pc = arg.target;
+                    }
+                },
+                .super_local_get_i32_const_i32_le_u_br_if => |arg| {
+                    const lhs: u32 = @bitCast((try self.getLocal(arg.local)).i32);
+                    const rhs: u32 = @bitCast(arg.imm);
+                    if (lhs <= rhs) {
+                        pc = arg.target;
+                    }
+                },
+                .super_i32_const_local_set => |arg| {
+                    try self.setLocal(arg.local, .{ .i32 = arg.imm });
+                },
+                .super_i64_const_local_set => |arg| {
+                    try self.setLocal(arg.local, .{ .i64 = arg.imm });
+                },
+                .super_f32_const_local_set => |arg| {
+                    try self.setLocal(arg.local, .{ .f32 = arg.imm });
+                },
+                .super_f64_const_local_set => |arg| {
+                    try self.setLocal(arg.local, .{ .f64 = arg.imm });
+                },
+                .super_i32_const_return => |imm| {
+                    if (try self.superConstReturn(i32, imm, &pc)) return;
+                },
+                .super_i64_const_return => |imm| {
+                    if (try self.superConstReturn(i64, imm, &pc)) return;
+                },
+                .super_f32_const_return => |imm| {
+                    if (try self.superConstReturn(f32, imm, &pc)) return;
+                },
+                .super_f64_const_return => |imm| {
+                    if (try self.superConstReturn(f64, imm, &pc)) return;
                 },
                 .drop => {
                     self.stack.top -= 1;
