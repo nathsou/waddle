@@ -8,5 +8,6 @@ WASM core 1.0 Virtual Machine in Zig
 - [x] Text format (.wat) parser
 - [x] Bytecode interpreter
 - [ ] Module validation
+- [ ] Pass all official tests
 - [ ] WASI preview 1 support
 - [ ] AOT compiler
