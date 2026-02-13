@@ -1,8 +1,8 @@
 const std = @import("std");
 const waddle = @import("waddle");
+const builtin = @import("builtin");
 const parse = waddle.parse;
 const wat = waddle.wat;
-const builtin = @import("builtin");
 const runtime = waddle.runtime;
 const types = waddle.types;
 
@@ -91,32 +91,44 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runt
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
     const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    var module: types.Module = undefined;
 
     if (std.ascii.endsWithIgnoreCase(module_path, ".wasm")) {
         var parser = parse.Parser.init(allocator, bytes);
-        const module = try parser.readModule();
-        const module_inst = try store.instantiate(module, &.{});
-
-        var start_func_addr: ?runtime.FuncAddr = null;
-        if (module.start) |start_func_idx| {
-            const start_func_idx_usize = @as(usize, start_func_idx);
-
-            if (start_func_idx_usize >= module_inst.func_addrs.len) {
-                return error.InvalidStartFuncIndex;
-            }
-
-            start_func_addr = module_inst.func_addrs[start_func_idx_usize];
-        }
-
-        return try runtime.Runtime.init(allocator, store, module_inst, start_func_addr);
+        module = try parser.readModule();
     } else if (std.ascii.endsWithIgnoreCase(module_path, ".wat")) {
         var parser = try wat.Parser.init(bytes, allocator);
-        const module = try parser.parseModule();
-
-        std.debug.print("{any}\n", .{module});
-
-        return error.WatNotSupportedYet;
+        const wat_module = try parser.parseModule();
+        module = types.Module{
+            .custom = &.{},
+            .types = wat_module.types,
+            .imports = wat_module.imports,
+            .functions = wat_module.functions,
+            .tables = wat_module.tables,
+            .memories = wat_module.memories,
+            .globals = wat_module.globals,
+            .exports = wat_module.exports,
+            .start = wat_module.start,
+            .elements = wat_module.elements,
+            .codes = wat_module.codes,
+            .data = wat_module.data,
+        };
     } else {
         return error.UnsupportedModuleFormat;
     }
+
+    const module_inst = try store.instantiate(module, &.{});
+
+    var start_func_addr: ?runtime.FuncAddr = null;
+    if (module.start) |start_func_idx| {
+        const start_func_idx_usize = @as(usize, start_func_idx);
+
+        if (start_func_idx_usize >= module_inst.func_addrs.len) {
+            return error.InvalidStartFuncIndex;
+        }
+
+        start_func_addr = module_inst.func_addrs[start_func_idx_usize];
+    }
+
+    return try runtime.Runtime.init(allocator, store, module_inst, start_func_addr);
 }
