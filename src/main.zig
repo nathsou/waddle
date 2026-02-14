@@ -85,6 +85,18 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 }
 
+const host_env = struct {
+    fn printString(args: []types.Value, module: *runtime.ModuleInstance, store: *runtime.Store) ![]types.Value {
+        const mem_addr = module.exports_by_name.get("memory") orelse return error.MissingMemoryExport;
+        const mem = &store.mems.items[mem_addr.mem];
+        const offset: usize = @intCast(args[0].i32);
+        const length: usize = @intCast(args[1].i32);
+        const bytes = mem.data[offset .. offset + length];
+        std.debug.print("{s}", .{bytes});
+        return &.{};
+    }
+};
+
 fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runtime {
     var store = runtime.Store.init(allocator);
 
@@ -119,7 +131,21 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runt
         return error.UnsupportedModuleFormat;
     }
 
-    const module_inst = try store.instantiate(module, &.{});
+    const module_inst = try store.instantiate(module, &.{
+        .{
+            .module = "index",
+            .name = "printString",
+            .value = .{
+                .func = .{
+                    .type = .{
+                        .params = &.{ .i32, .i32 },
+                        .results = &.{},
+                    },
+                    .code = host_env.printString,
+                },
+            },
+        },
+    });
 
     var start_func_addr: ?runtime.FuncAddr = null;
     if (module.start) |start_func_idx| {

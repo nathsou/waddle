@@ -49,7 +49,7 @@ pub const Value = union(enum) {
 
 pub const Result = Value;
 
-pub const ResultType = []ValType;
+pub const ResultType = []const ValType;
 
 pub const BlockType = union(enum) {
     empty,
@@ -58,8 +58,8 @@ pub const BlockType = union(enum) {
 };
 
 pub const FuncType = struct {
-    params: []ValType,
-    results: []ValType,
+    params: []const ValType,
+    results: []const ValType,
 
     pub fn eql(self: FuncType, other: FuncType) bool {
         return std.mem.eql(ValType, self.params, other.params) and std.mem.eql(ValType, self.results, other.results);

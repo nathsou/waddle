@@ -30,8 +30,8 @@ pub const FlatInstr = union(enum) {
     br_table: BranchTableArg,
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
-    call_indirect: struct { func_type: types.FuncType, table: *const TableInstance },
-    call_host: *const HostFunc,
+    call_indirect: struct { func_type: *const types.FuncType, table: *const TableInstance },
+    call_host: FuncAddr,
 
     // Super instructions
     super_i32_eqz_br_if: PC,
@@ -536,6 +536,10 @@ const BytecodeLowering = struct {
     current_func: ?*const WasmFunc,
 
     pub fn init(allocator: Allocator, store: *const Store) !BytecodeLowering {
+        if (comptime @sizeOf(FlatInstr) > 32) {
+            @compileError("FlatInstr should be 32 bytes or less");
+        }
+
         const func_labels = try allocator.alloc(FuncLabel, store.funcs.items.len);
 
         for (func_labels) |*label| {
@@ -584,9 +588,7 @@ const BytecodeLowering = struct {
                 .wasm => |wasm_func| {
                     try self.lowerFunc(&wasm_func, i);
                 },
-                .host => {
-                    return error.UnsupportedFuncTypeForLowering;
-                },
+                .host => {},
             }
         }
 
@@ -1233,8 +1235,8 @@ const BytecodeLowering = struct {
                         std.debug.assert(func_idx < self.func_labels.len);
                         try self.func_labels[func_idx].calls_to_patch.append(self.allocator, call_instr_idx);
                     },
-                    .host => |*host_func| {
-                        try self.emit(.{ .call_host = host_func });
+                    .host => {
+                        try self.emit(.{ .call_host = func_idx });
                     },
                 }
             },
@@ -1245,7 +1247,7 @@ const BytecodeLowering = struct {
                 const table_addr = module_inst.table_addrs[arg.table_idx];
                 const table_inst = &self.store.tables.items[table_addr];
                 std.debug.assert(module_inst.types.len > arg.type_idx);
-                const func_type = module_inst.types[arg.type_idx];
+                const func_type = &module_inst.types[arg.type_idx];
                 try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table = table_inst } });
             },
             .@"return" => {
@@ -1503,6 +1505,7 @@ pub const Store = struct {
 
         const module_inst = try allocator.create(ModuleInstance);
         errdefer allocator.destroy(module_inst);
+
         module_inst.* = ModuleInstance{
             .types = module.types,
             .func_addrs = func_addrs,
@@ -1510,7 +1513,10 @@ pub const Store = struct {
             .mem_addrs = mem_addrs,
             .global_addrs = global_addrs,
             .exports = exports,
+            .exports_by_name = .init(allocator),
         };
+
+        errdefer module_inst.deinit(self.allocator);
 
         const func_base = self.funcs.items.len;
         const table_base = self.tables.items.len;
@@ -1684,6 +1690,12 @@ pub const Store = struct {
                     };
                 },
             }
+
+            if (module_inst.exports_by_name.contains(exp.name)) {
+                return error.DuplicateExportName;
+            }
+
+            try module_inst.exports_by_name.put(exp.name, module_inst.exports[i].value);
         }
 
         return module_inst;
@@ -1712,14 +1724,39 @@ pub const Store = struct {
         }
     }
 
-    pub fn instantiate(self: *Store, module: types.Module, extern_vals: []const ExternVal) !*ModuleInstance {
-        // TODO: Validate the module
+    fn registerHostFunc(self: *Store, func: HostFunc) !FuncAddr {
+        const func_addr = self.funcs.items.len;
+        try self.funcs.append(self.allocator, FuncInstance{ .host = func });
+        return func_addr;
+    }
 
-        if (extern_vals.len != module.imports.len) {
-            return error.ImportCountMismatch;
+    const ImportVal = union(enum) {
+        func: HostFunc,
+        global: GlobalAddr,
+    };
+
+    const Import = struct {
+        module: types.Name,
+        name: types.Name,
+        value: ImportVal,
+    };
+
+    fn lookupImport(module: types.Name, name: types.Name, imports: []const Import) !ImportVal {
+        for (imports) |import| {
+            if (std.mem.eql(u8, import.module, module) and std.mem.eql(u8, import.name, name)) {
+                return import.value;
+            }
         }
 
-        // TODO: Validate extern vals against import details (limits, signatures).
+        return error.ImportNotFound;
+    }
+
+    pub fn instantiate(self: *Store, module: types.Module, imports: []const Import) !*ModuleInstance {
+        // TODO: Validate the module
+
+        if (imports.len != module.imports.len) {
+            return error.ImportCountMismatch;
+        }
 
         const num_global_imports = blk: {
             var count: usize = 0;
@@ -1735,29 +1772,33 @@ pub const Store = struct {
         defer self.allocator.free(global_extern_vals);
         var global_import_idx: usize = 0;
 
-        for (module.imports, 0..) |import, i| {
-            const extern_val = extern_vals[i];
+        var extern_vals: std.ArrayList(ExternVal) = try .initCapacity(self.allocator, module.imports.len);
+        defer extern_vals.deinit(self.allocator);
+
+        for (module.imports) |import| {
+            const import_val = try lookupImport(import.module, import.name, imports);
+
             switch (import.desc) {
-                .func => {
-                    switch (extern_val) {
-                        .func => {},
+                .func => |func_type_index| {
+                    switch (import_val) {
+                        .func => |host_func| {
+                            const func_addr = try self.registerHostFunc(host_func);
+                            const func_inst = &self.funcs.items[func_addr];
+                            const expected_type = module.types[@as(usize, func_type_index)];
+
+                            if (!func_inst.getType().eql(expected_type)) {
+                                return error.FuncImportTypeMismatch;
+                            }
+
+                            try extern_vals.append(self.allocator, .{ .func = func_addr });
+                        },
                         else => return error.InvalidFuncImport,
                     }
                 },
-                .table => {
-                    switch (extern_val) {
-                        .table => {},
-                        else => return error.InvalidTableImport,
-                    }
-                },
-                .mem => {
-                    switch (extern_val) {
-                        .mem => {},
-                        else => return error.InvalidMemImport,
-                    }
-                },
+                .table => {},
+                .mem => {},
                 .global => {
-                    global_extern_vals[global_import_idx] = switch (extern_val) {
+                    global_extern_vals[global_import_idx] = switch (import_val) {
                         .global => |addr| addr,
                         else => return error.InvalidGlobalImport,
                     };
@@ -1774,7 +1815,7 @@ pub const Store = struct {
             global_init_vals[i] = val;
         }
 
-        const module_inst = try self.allocModule(self.allocator, module, extern_vals, global_init_vals);
+        const module_inst = try self.allocModule(self.allocator, module, extern_vals.items, global_init_vals);
 
         // Initalise element segments
         for (module.elements) |elem| {
@@ -1859,6 +1900,7 @@ pub const ModuleInstance = struct {
     mem_addrs: []MemAddr,
     global_addrs: []GlobalAddr,
     exports: []ExportInstance,
+    exports_by_name: std.StringHashMap(ExternVal),
 
     pub fn deinit(self: *ModuleInstance, allocator: Allocator) void {
         allocator.free(self.func_addrs);
@@ -1866,6 +1908,7 @@ pub const ModuleInstance = struct {
         allocator.free(self.mem_addrs);
         allocator.free(self.global_addrs);
         allocator.free(self.exports);
+        self.exports_by_name.deinit();
     }
 };
 
@@ -1875,9 +1918,9 @@ const WasmFunc = struct {
     code: types.Func,
 };
 
-const HostFunc = struct {
+pub const HostFunc = struct {
     type: types.FuncType,
-    code: *const fn ([]Value) anyerror![]Value,
+    code: *const fn ([]Value, *ModuleInstance, *Store) anyerror![]Value,
 };
 
 const FuncInstance = union(enum) {
@@ -2193,7 +2236,7 @@ pub const Runtime = struct {
                 for (0..arg_count) |i| {
                     args[i] = self.stack.getValue(args_start + i);
                 }
-                const res = try host_func.code(args);
+                const res = try host_func.code(args, self.module, &self.store);
                 self.stack.top = args_start;
                 return res;
             },
@@ -2418,17 +2461,25 @@ pub const Runtime = struct {
 
                     pc = call.entry_pc;
                 },
-                .call_host => |host_func| {
+                .call_host => |host_func_addr| {
+                    if (host_func_addr >= self.store.funcs.items.len) {
+                        return error.InvalidFuncIndex;
+                    }
+
+                    const host_func = &self.store.funcs.items[host_func_addr].host;
                     const arg_count = host_func.type.params.len;
                     const args = try self.allocator.alloc(Value, arg_count);
                     defer self.allocator.free(args);
                     const args_start = self.stack.top - arg_count;
+
                     for (0..arg_count) |i| {
                         args[i] = self.stack.getValue(args_start + i);
                     }
+
                     self.stack.top -= arg_count;
-                    const result = try host_func.code(args);
-                    for (result) |val| {
+                    const results = try host_func.code(args, self.module, &self.store);
+
+                    for (results) |val| {
                         try self.pushValue(val);
                     }
                 },
@@ -2442,7 +2493,7 @@ pub const Runtime = struct {
                     if (call.table.elem[i]) |func_addr| {
                         const func_inst = self.store.funcs.items[func_addr];
 
-                        if (!func_inst.getType().eql(call.func_type)) {
+                        if (!func_inst.getType().eql(call.func_type.*)) {
                             return error.IndirectCallTypeMismatch;
                         }
 
