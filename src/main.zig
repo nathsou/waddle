@@ -135,15 +135,7 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runt
         .{
             .module = "index",
             .name = "printString",
-            .value = .{
-                .func = .{
-                    .type = .{
-                        .params = &.{ .i32, .i32 },
-                        .results = &.{},
-                    },
-                    .code = host_env.printString,
-                },
-            },
+            .value = .{ .func = host_env.printString },
         },
     });
 

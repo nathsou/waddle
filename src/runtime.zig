@@ -1724,14 +1724,14 @@ pub const Store = struct {
         }
     }
 
-    fn registerHostFunc(self: *Store, func: HostFunc) !FuncAddr {
+    fn registerHostFunc(self: *Store, ty: types.FuncType, func: HostFuncPtr) !FuncAddr {
         const func_addr = self.funcs.items.len;
-        try self.funcs.append(self.allocator, FuncInstance{ .host = func });
+        try self.funcs.append(self.allocator, .{ .host = .{ .type = ty, .code = func } });
         return func_addr;
     }
 
     const ImportVal = union(enum) {
-        func: HostFunc,
+        func: HostFuncPtr,
         global: GlobalAddr,
     };
 
@@ -1782,14 +1782,8 @@ pub const Store = struct {
                 .func => |func_type_index| {
                     switch (import_val) {
                         .func => |host_func| {
-                            const func_addr = try self.registerHostFunc(host_func);
-                            const func_inst = &self.funcs.items[func_addr];
-                            const expected_type = module.types[@as(usize, func_type_index)];
-
-                            if (!func_inst.getType().eql(expected_type)) {
-                                return error.FuncImportTypeMismatch;
-                            }
-
+                            const func_type = module.types[@as(usize, func_type_index)];
+                            const func_addr = try self.registerHostFunc(func_type, host_func);
                             try extern_vals.append(self.allocator, .{ .func = func_addr });
                         },
                         else => return error.InvalidFuncImport,
@@ -1918,9 +1912,11 @@ const WasmFunc = struct {
     code: types.Func,
 };
 
+pub const HostFuncPtr = *const fn ([]Value, *ModuleInstance, *Store) anyerror![]Value;
+
 pub const HostFunc = struct {
     type: types.FuncType,
-    code: *const fn ([]Value, *ModuleInstance, *Store) anyerror![]Value,
+    code: HostFuncPtr,
 };
 
 const FuncInstance = union(enum) {
