@@ -90,7 +90,9 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runt
 
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
-    const bytes = try file.readToEndAlloc(allocator, 1024 * 1024);
+    var file_read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(&file_read_buffer);
+    const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
     var module: types.Module = undefined;
 
     if (std.ascii.endsWithIgnoreCase(module_path, ".wasm")) {

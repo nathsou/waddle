@@ -405,11 +405,6 @@ pub const Parser = struct {
             0x11 => {
                 const type_idx = try self.readU32();
                 const table_idx = try self.readByte();
-
-                if (table_idx != 0x00) {
-                    return error.InvalidCallIndirectInstruction;
-                }
-
                 return .{ .call_indirect = .{ .type_idx = type_idx, .table_idx = table_idx } };
             },
             0x1A => .drop,
@@ -587,8 +582,16 @@ pub const Parser = struct {
             0xBD => .i64_reinterpret_f64,
             0xBE => .f32_reinterpret_i32,
             0xBF => .f64_reinterpret_i64,
+            0xC0 => .i32_extend8_s,
+            0xC1 => .i32_extend16_s,
+            0xC2 => .i64_extend8_s,
+            0xC3 => .i64_extend16_s,
+            0xC4 => .i64_extend32_s,
 
-            else => return error.InvalidInstruction,
+            else => {
+                std.debug.print("Unknown opcode: {x}\n", .{opcode});
+                return error.InvalidInstruction;
+            },
         };
     }
 

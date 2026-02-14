@@ -292,6 +292,11 @@ pub const Instr = union(enum) {
     i64_reinterpret_f64,
     f32_reinterpret_i32,
     f64_reinterpret_i64,
+    i32_extend8_s,
+    i32_extend16_s,
+    i64_extend8_s,
+    i64_extend16_s,
+    i64_extend32_s,
 };
 
 pub const Expr = []Instr;

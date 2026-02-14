@@ -220,6 +220,11 @@ pub const FlatInstr = union(enum) {
     i64_reinterpret_f64,
     f32_reinterpret_i32,
     f64_reinterpret_i64,
+    i32_extend8_s,
+    i32_extend16_s,
+    i64_extend8_s,
+    i64_extend16_s,
+    i64_extend32_s,
 
     pub fn format(self: FlatInstr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -441,6 +446,11 @@ pub const FlatInstr = union(enum) {
             .i64_reinterpret_f64 => try writer.writeAll("i64.reinterpret_f64"),
             .f32_reinterpret_i32 => try writer.writeAll("f32.reinterpret_i32"),
             .f64_reinterpret_i64 => try writer.writeAll("f64.reinterpret_i64"),
+            .i32_extend8_s => try writer.writeAll("i32.extend8_s"),
+            .i32_extend16_s => try writer.writeAll("i32.extend16_s"),
+            .i64_extend8_s => try writer.writeAll("i64.extend8_s"),
+            .i64_extend16_s => try writer.writeAll("i64.extend16_s"),
+            .i64_extend32_s => try writer.writeAll("i64.extend32_s"),
         }
     }
 };
@@ -1418,6 +1428,11 @@ const BytecodeLowering = struct {
             .i64_reinterpret_f64 => try self.emit(.i64_reinterpret_f64),
             .f32_reinterpret_i32 => try self.emit(.f32_reinterpret_i32),
             .f64_reinterpret_i64 => try self.emit(.f64_reinterpret_i64),
+            .i32_extend8_s => try self.emit(.i32_extend8_s),
+            .i32_extend16_s => try self.emit(.i32_extend16_s),
+            .i64_extend8_s => try self.emit(.i64_extend8_s),
+            .i64_extend16_s => try self.emit(.i64_extend16_s),
+            .i64_extend32_s => try self.emit(.i64_extend32_s),
         }
     }
 };
@@ -2150,6 +2165,8 @@ pub const Runtime = struct {
                     .return_pc = null,
                 });
 
+                defer self.call_stack.top -= 1;
+
                 if (self.bytecode.functions[func_addr]) |entry_pc| {
                     try self.execute(entry_pc);
                     var result: []Value = &[_]Value{};
@@ -2307,9 +2324,12 @@ pub const Runtime = struct {
         return @intFromFloat(val);
     }
 
-    fn extendInt(comptime signedness: std.builtin.Signedness, val: i32) i64 {
-        const Src = std.meta.Int(signedness, 32);
-        return @intCast(@as(Src, @bitCast(val)));
+    fn intExtend(comptime Dst: type, comptime Src: type, val: anytype) Dst {
+        const Val = @TypeOf(val);
+        const UVal = std.meta.Int(.unsigned, @bitSizeOf(Val));
+        const USrc = std.meta.Int(.unsigned, @bitSizeOf(Src));
+        const truncated: USrc = @truncate(@as(UVal, @bitCast(val)));
+        return @intCast(@as(Src, @bitCast(truncated)));
     }
 
     fn memLoad(self: *Runtime, comptime T: type, memarg: MemArg) !T {
@@ -3125,10 +3145,10 @@ pub const Runtime = struct {
                     try self.push(i32, @bitCast(try truncFloat(u32, f64, self.pop(f64))));
                 },
                 .i64_extend_i32_s => {
-                    try self.push(i64, extendInt(.signed, self.pop(i32)));
+                    try self.push(i64, intExtend(i64, i32, self.pop(i32)));
                 },
                 .i64_extend_i32_u => {
-                    try self.push(i64, extendInt(.unsigned, self.pop(i32)));
+                    try self.push(i64, intExtend(i64, u32, self.pop(i32)));
                 },
                 .i64_trunc_f32_s => {
                     try self.push(i64, try truncFloat(i64, f32, self.pop(f32)));
@@ -3197,6 +3217,21 @@ pub const Runtime = struct {
                 .f64_reinterpret_i64 => {
                     const v = self.pop(i64);
                     try self.push(f64, @bitCast(v));
+                },
+                .i32_extend8_s => {
+                    try self.push(i32, intExtend(i32, i8, self.pop(i32)));
+                },
+                .i32_extend16_s => {
+                    try self.push(i32, intExtend(i32, i16, self.pop(i32)));
+                },
+                .i64_extend8_s => {
+                    try self.push(i64, intExtend(i64, i8, self.pop(i64)));
+                },
+                .i64_extend16_s => {
+                    try self.push(i64, intExtend(i64, i16, self.pop(i64)));
+                },
+                .i64_extend32_s => {
+                    try self.push(i64, intExtend(i64, i32, self.pop(i64)));
                 },
             }
         }
