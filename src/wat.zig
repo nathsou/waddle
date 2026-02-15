@@ -1851,6 +1851,11 @@ pub const Parser = struct {
         .{ "i64.reinterpret_f64", InstrHandler{ .simple = .i64_reinterpret_f64 } },
         .{ "f32.reinterpret_i32", InstrHandler{ .simple = .f32_reinterpret_i32 } },
         .{ "f64.reinterpret_i64", InstrHandler{ .simple = .f64_reinterpret_i64 } },
+        .{ "i32.extend8_s", InstrHandler{ .simple = .i32_extend8_s } },
+        .{ "i32.extend16_s", InstrHandler{ .simple = .i32_extend16_s } },
+        .{ "i64.extend8_s", InstrHandler{ .simple = .i64_extend8_s } },
+        .{ "i64.extend16_s", InstrHandler{ .simple = .i64_extend16_s } },
+        .{ "i64.extend32_s", InstrHandler{ .simple = .i64_extend32_s } },
     });
 
     fn parseInstr(self: *Parser, keyword: []const u8) !types.Instr {

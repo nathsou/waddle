@@ -56,10 +56,6 @@ pub const Parser = struct {
         return std.leb.readIleb128(T, self);
     }
 
-    fn readU8(self: *Parser) !u8 {
-        return self.readUInt(u8);
-    }
-
     fn readU16(self: *Parser) !u16 {
         return self.readUInt(u16);
     }
@@ -304,7 +300,7 @@ pub const Parser = struct {
     fn readData(self: *Parser) !types.Data {
         const mem_idx = try self.readU32();
         const offset_expr = try self.readExpr();
-        const init_bytes = try self.readVector(types.Byte, readU8);
+        const init_bytes = try self.readVector(types.Byte, readByte);
 
         return .{
             .mem = mem_idx,
@@ -609,6 +605,7 @@ pub const Parser = struct {
             self.index += 1; // Consume ID
             return try self.readU32(); // Consume Size
         }
+
         return null;
     }
 
@@ -686,6 +683,14 @@ pub const Parser = struct {
         return try self.readVector(types.Elem, readElem);
     }
 
+    fn readDataCountSection(self: *Parser) !?u32 {
+        if (try self.readSectionHeader(12)) |_| {
+            return try self.readU32();
+        }
+
+        return null;
+    }
+
     fn readCodeSection(self: *Parser) ![]types.Code {
         _ = try self.readSectionHeader(10) orelse return &.{};
         return try self.readVector(types.Code, readCode);
@@ -729,10 +734,19 @@ pub const Parser = struct {
         try self.readCustomSections(&custom_sections);
         const elements = try self.readElementSection();
         try self.readCustomSections(&custom_sections);
+        const data_count = try self.readDataCountSection();
+        try self.readCustomSections(&custom_sections);
         const codes = try self.readCodeSection();
         try self.readCustomSections(&custom_sections);
         const data = try self.readDataSection();
         try self.readCustomSections(&custom_sections);
+
+        if (data_count) |count| {
+            if (count != @as(u32, @intCast(data.len))) {
+                std.debug.print("Data count mismatch: expected {d}, found {d}\n", .{ count, data.len });
+                return error.DataCountMismatch;
+            }
+        }
 
         return types.Module{
             .custom = try custom_sections.toOwnedSlice(self.allocator),

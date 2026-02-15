@@ -24,40 +24,39 @@ fn run(allocator: std.mem.Allocator) !void {
 
     const args = try std.process.argsAlloc(arena.allocator());
 
-    if (args.len == 1 or args.len > 4) {
-        std.debug.print(
-            "Usage: {s} [options] <wasm-module> [function]\n" ++
-                "Options:\n" ++
-                "  -p, --print-bytecode  Print bytecode instructions\n" ++
-                "  If no function is provided, invokes the start function.\n",
-            .{args[0]},
-        );
-
+    if (args.len == 1) {
+        printUsage(args[0]);
         return;
     }
 
-    // Parse options
     var print_bytecode = false;
-    var wasm_path_idx: ?usize = null;
-    var func_name: ?[]const u8 = null;
+    var wasm_path: ?[]const u8 = null;
+    var invoke_idx: ?usize = null;
 
     for (args[1..], 1..) |arg, idx| {
-        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print-bytecode")) {
+        if (std.mem.eql(u8, arg, "--invoke")) {
+            invoke_idx = idx;
+            break;
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print-bytecode")) {
             print_bytecode = true;
-        } else if (wasm_path_idx == null) {
-            wasm_path_idx = idx;
+        } else if (wasm_path == null) {
+            wasm_path = arg;
         } else {
-            func_name = arg;
+            std.debug.print(
+                "Error: unexpected argument before --invoke: {s}\n",
+                .{arg},
+            );
+            return;
         }
     }
 
-    if (wasm_path_idx == null) {
-        std.debug.print("Error: missing wasm-module argument\n", .{});
+    if (wasm_path == null) {
+        std.debug.print("Error: missing <file.wasm/.wat> argument\n", .{});
+        printUsage(args[0]);
         return;
     }
 
-    const wasm_path = args[wasm_path_idx.?];
-    var vm = try createVM(arena.allocator(), wasm_path);
+    var vm = try createVM(arena.allocator(), wasm_path.?);
     defer vm.deinit();
 
     if (print_bytecode) {
@@ -68,8 +67,31 @@ fn run(allocator: std.mem.Allocator) !void {
         _ = try std.posix.write(std.posix.STDERR_FILENO, allocating_writer.writer.buffer);
     }
 
-    if (func_name) |fname| {
-        const results = try vm.invokeExportedFunc(fname);
+    if (invoke_idx) |invoke_flag_idx| {
+        if (invoke_flag_idx + 1 >= args.len) {
+            std.debug.print("Error: missing <func_name> after --invoke\n", .{});
+            printUsage(args[0]);
+            return;
+        }
+
+        const func_name = args[invoke_flag_idx + 1];
+        const func_arg_strings = args[invoke_flag_idx + 2 ..];
+
+        const func_type = try vm.getExportedFuncType(func_name);
+        if (func_type.params.len != func_arg_strings.len) {
+            std.debug.print(
+                "Error: function '{s}' expects {d} argument(s), got {d}\n",
+                .{ func_name, func_type.params.len, func_arg_strings.len },
+            );
+            return;
+        }
+
+        const func_args = try arena.allocator().alloc(types.Value, func_type.params.len);
+        for (func_type.params, 0..) |param_type, i| {
+            func_args[i] = try parseValue(func_arg_strings[i], param_type);
+        }
+
+        const results = try vm.invokeExportedFunc(func_name, func_args);
 
         for (results, 0..) |res, i| {
             std.debug.print("{f}", .{res});
@@ -79,20 +101,36 @@ fn run(allocator: std.mem.Allocator) !void {
             }
         }
 
-        std.debug.print("\n", .{});
+        if (results.len > 0) {
+            std.debug.print("\n", .{});
+        }
     } else {
         try vm.invokeStartFunc();
     }
 }
 
+fn parseValue(raw: []const u8, val_type: types.ValType) !types.Value {
+    return switch (val_type) {
+        .i32 => .{ .i32 = try std.fmt.parseInt(i32, raw, 0) },
+        .i64 => .{ .i64 = try std.fmt.parseInt(i64, raw, 0) },
+        .f32 => .{ .f32 = try std.fmt.parseFloat(f32, raw) },
+        .f64 => .{ .f64 = try std.fmt.parseFloat(f64, raw) },
+    };
+}
+
+fn printUsage(program_name: []const u8) void {
+    std.debug.print(
+        "Usage: {s} [options] <file.wasm/.wat> [--invoke <func_name> [<func_args>]]\n" ++
+            "Options:\n" ++
+            "  -p, --print-bytecode  Print bytecode instructions\n",
+        .{program_name},
+    );
+}
+
 const host_env = struct {
-    fn printString(args: []types.Value, module: *runtime.ModuleInstance, store: *runtime.Store) ![]types.Value {
-        const mem_addr = module.exports_by_name.get("memory") orelse return error.MissingMemoryExport;
-        const mem = &store.mems.items[mem_addr.mem];
-        const offset: usize = @intCast(args[0].i32);
-        const length: usize = @intCast(args[1].i32);
-        const bytes = mem.data[offset .. offset + length];
-        std.debug.print("{s}", .{bytes});
+    fn printChar(args: []const types.Value, _: *runtime.ModuleInstance, _: *runtime.Store) ![]types.Value {
+        const char_code: u8 = @intCast(args[0].i32);
+        std.debug.print("{c}", .{char_code});
         return &.{};
     }
 };
@@ -133,9 +171,9 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runt
 
     const module_inst = try store.instantiate(module, &.{
         .{
-            .module = "index",
-            .name = "printString",
-            .value = .{ .func = host_env.printString },
+            .module = "spectest",
+            .name = "print_char",
+            .value = .{ .func = host_env.printChar },
         },
     });
 

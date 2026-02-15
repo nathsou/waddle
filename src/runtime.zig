@@ -1754,10 +1754,6 @@ pub const Store = struct {
     pub fn instantiate(self: *Store, module: types.Module, imports: []const Import) !*ModuleInstance {
         // TODO: Validate the module
 
-        if (imports.len != module.imports.len) {
-            return error.ImportCountMismatch;
-        }
-
         const num_global_imports = blk: {
             var count: usize = 0;
             for (module.imports) |import| {
@@ -1912,7 +1908,7 @@ const WasmFunc = struct {
     code: types.Func,
 };
 
-pub const HostFuncPtr = *const fn ([]Value, *ModuleInstance, *Store) anyerror![]Value;
+pub const HostFuncPtr = *const fn ([]const Value, *ModuleInstance, *Store) anyerror![]Value;
 
 pub const HostFunc = struct {
     type: types.FuncType,
@@ -2164,17 +2160,39 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn invokeExportedFunc(self: *Runtime, export_name: types.Name) ![]Value {
-        for (self.module.exports) |exp| {
-            if (std.mem.eql(u8, exp.name, export_name)) {
-                return switch (exp.value) {
-                    .func => |func_addr| try self.invokeFunc(func_addr),
-                    else => error.ExportNotAFunction,
-                };
-            }
+    pub fn getExportByName(self: *Runtime, name: types.Name) !ExternVal {
+        if (self.module.exports_by_name.get(name)) |exp| {
+            return exp;
+        } else {
+            return error.ExportNotFound;
+        }
+    }
+
+    pub fn getExportedFuncType(self: *Runtime, export_name: types.Name) !types.FuncType {
+        const exp = try self.getExportByName(export_name);
+        return switch (exp) {
+            .func => |func_addr| self.store.funcs.items[func_addr].getType(),
+            else => return error.ExportNotAFunction,
+        };
+    }
+
+    pub fn invokeExportedFunc(self: *Runtime, export_name: types.Name, args: []const Value) ![]Value {
+        const exp = try self.getExportByName(export_name);
+        return switch (exp) {
+            .func => |func_addr| self.invokeFuncWithArgs(func_addr, args),
+            else => return error.ExportNotAFunction,
+        };
+    }
+
+    pub fn invokeFuncWithArgs(self: *Runtime, func_addr: FuncAddr, args: []const Value) ![]Value {
+        const old_stack_top = self.stack.top;
+        errdefer self.stack.top = old_stack_top;
+
+        for (args) |arg| {
+            try self.pushValue(arg);
         }
 
-        return error.ExportNotFound;
+        return try self.invokeFunc(func_addr);
     }
 
     pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr) ![]Value {
