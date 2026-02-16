@@ -613,6 +613,30 @@ pub const Parser = struct {
                 const op = try self.readU32();
 
                 switch (op) {
+                    0 => {
+                        return .i32_trunc_sat_f32_s;
+                    },
+                    1 => {
+                        return .i32_trunc_sat_f32_u;
+                    },
+                    2 => {
+                        return .i32_trunc_sat_f64_s;
+                    },
+                    3 => {
+                        return .i32_trunc_sat_f64_u;
+                    },
+                    4 => {
+                        return .i64_trunc_sat_f32_s;
+                    },
+                    5 => {
+                        return .i64_trunc_sat_f32_u;
+                    },
+                    6 => {
+                        return .i64_trunc_sat_f64_s;
+                    },
+                    7 => {
+                        return .i64_trunc_sat_f64_u;
+                    },
                     8 => {
                         const data_idx = try self.readU32();
                         const mem_idx = try self.readU32();
@@ -632,7 +656,7 @@ pub const Parser = struct {
                         return .{ .memory_fill = mem_idx };
                     },
                     else => {
-                        return error.InvalidBulkMemoryInstruction;
+                        return error.UnsupportedMiscellaneousOpcode;
                     },
                 }
             },

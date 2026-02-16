@@ -11,6 +11,7 @@ WASM core 1.0 Virtual Machine in Zig
 ## Extensions
 
 - [x] [Multi-value](https://github.com/WebAssembly/spec/blob/main/proposals/multi-value/Overview.md)
+- [x] [Non-trapping Float-to-int Conversions](https://github.com/WebAssembly/spec/blob/main/proposals/nontrapping-float-to-int-conversion/Overview.md)
 - [ ] [Bulk Memory Operations](https://github.com/WebAssembly/spec/blob/main/proposals/bulk-memory-operations/Overview.md)
 
 ## TODO

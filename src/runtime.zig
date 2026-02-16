@@ -229,6 +229,14 @@ pub const FlatInstr = union(enum) {
     i64_extend8_s,
     i64_extend16_s,
     i64_extend32_s,
+    i32_trunc_sat_f32_s,
+    i32_trunc_sat_f32_u,
+    i32_trunc_sat_f64_s,
+    i32_trunc_sat_f64_u,
+    i64_trunc_sat_f32_s,
+    i64_trunc_sat_f32_u,
+    i64_trunc_sat_f64_s,
+    i64_trunc_sat_f64_u,
 
     pub fn format(self: FlatInstr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -455,6 +463,15 @@ pub const FlatInstr = union(enum) {
             .i64_extend8_s => try writer.writeAll("i64.extend8_s"),
             .i64_extend16_s => try writer.writeAll("i64.extend16_s"),
             .i64_extend32_s => try writer.writeAll("i64.extend32_s"),
+            // Saturating truncation instructions
+            .i32_trunc_sat_f32_s => try writer.writeAll("i32.trunc_sat_f32_s"),
+            .i32_trunc_sat_f32_u => try writer.writeAll("i32.trunc_sat_f32_u"),
+            .i32_trunc_sat_f64_s => try writer.writeAll("i32.trunc_sat_f64_s"),
+            .i32_trunc_sat_f64_u => try writer.writeAll("i32.trunc_sat_f64_u"),
+            .i64_trunc_sat_f32_s => try writer.writeAll("i64.trunc_sat_f32_s"),
+            .i64_trunc_sat_f32_u => try writer.writeAll("i64.trunc_sat_f32_u"),
+            .i64_trunc_sat_f64_s => try writer.writeAll("i64.trunc_sat_f64_s"),
+            .i64_trunc_sat_f64_u => try writer.writeAll("i64.trunc_sat_f64_u"),
 
             // Bulk memory operations
             .memory_init => |arg| try writer.print("memory.init data={d} mem={d}", .{ arg.data_idx, arg.mem }),
@@ -1461,6 +1478,14 @@ const BytecodeLowering = struct {
             .i64_extend8_s => try self.emit(.i64_extend8_s),
             .i64_extend16_s => try self.emit(.i64_extend16_s),
             .i64_extend32_s => try self.emit(.i64_extend32_s),
+            .i32_trunc_sat_f32_s => try self.emit(.i32_trunc_sat_f32_s),
+            .i32_trunc_sat_f32_u => try self.emit(.i32_trunc_sat_f32_u),
+            .i32_trunc_sat_f64_s => try self.emit(.i32_trunc_sat_f64_s),
+            .i32_trunc_sat_f64_u => try self.emit(.i32_trunc_sat_f64_u),
+            .i64_trunc_sat_f32_s => try self.emit(.i64_trunc_sat_f32_s),
+            .i64_trunc_sat_f32_u => try self.emit(.i64_trunc_sat_f32_u),
+            .i64_trunc_sat_f64_s => try self.emit(.i64_trunc_sat_f64_s),
+            .i64_trunc_sat_f64_u => try self.emit(.i64_trunc_sat_f64_u),
         }
     }
 };
@@ -1779,6 +1804,8 @@ pub const Store = struct {
                 return import.value;
             }
         }
+
+        std.debug.print("Import not found: {s}.{s}\n", .{ module, name });
 
         return error.ImportNotFound;
     }
@@ -2457,6 +2484,18 @@ pub const Runtime = struct {
 
         const bytes = mem_inst.data[effective_addr .. effective_addr + N];
         std.mem.writeInt(T, bytes[0..N], val, .little);
+    }
+
+    fn truncSat(comptime Dst: type, comptime Src: type, val: Src) Dst {
+        const truncated: Dst = @intFromFloat(val);
+
+        if (truncated < std.math.minInt(Dst)) {
+            return std.math.minInt(Dst);
+        } else if (truncated > std.math.maxInt(Dst)) {
+            return std.math.maxInt(Dst);
+        } else {
+            return truncated;
+        }
     }
 
     pub fn execute(self: *Runtime, start_pc: usize) !void {
@@ -3381,6 +3420,30 @@ pub const Runtime = struct {
                 },
                 .i64_extend32_s => {
                     try self.push(i64, intExtend(i64, i32, self.pop(i64)));
+                },
+                .i32_trunc_sat_f32_s => {
+                    try self.push(i32, truncSat(i32, f32, self.pop(f32)));
+                },
+                .i32_trunc_sat_f32_u => {
+                    try self.push(i32, @bitCast(truncSat(u32, f32, self.pop(f32))));
+                },
+                .i32_trunc_sat_f64_s => {
+                    try self.push(i32, truncSat(i32, f64, self.pop(f64)));
+                },
+                .i32_trunc_sat_f64_u => {
+                    try self.push(i32, @bitCast(truncSat(u32, f64, self.pop(f64))));
+                },
+                .i64_trunc_sat_f32_s => {
+                    try self.push(i64, truncSat(i64, f32, self.pop(f32)));
+                },
+                .i64_trunc_sat_f32_u => {
+                    try self.push(i64, @bitCast(truncSat(u64, f32, self.pop(f32))));
+                },
+                .i64_trunc_sat_f64_s => {
+                    try self.push(i64, truncSat(i64, f64, self.pop(f64)));
+                },
+                .i64_trunc_sat_f64_u => {
+                    try self.push(i64, @bitCast(truncSat(u64, f64, self.pop(f64))));
                 },
             }
         }

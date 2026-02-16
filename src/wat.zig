@@ -1897,6 +1897,14 @@ pub const Parser = struct {
         .{ "i64.extend8_s", InstrHandler{ .simple = .i64_extend8_s } },
         .{ "i64.extend16_s", InstrHandler{ .simple = .i64_extend16_s } },
         .{ "i64.extend32_s", InstrHandler{ .simple = .i64_extend32_s } },
+        .{ "i32.trunc_sat_f32_s", InstrHandler{ .simple = .i32_trunc_sat_f32_s } },
+        .{ "i32.trunc_sat_f32_u", InstrHandler{ .simple = .i32_trunc_sat_f32_u } },
+        .{ "i32.trunc_sat_f64_s", InstrHandler{ .simple = .i32_trunc_sat_f64_s } },
+        .{ "i32.trunc_sat_f64_u", InstrHandler{ .simple = .i32_trunc_sat_f64_u } },
+        .{ "i64.trunc_sat_f32_s", InstrHandler{ .simple = .i64_trunc_sat_f32_s } },
+        .{ "i64.trunc_sat_f32_u", InstrHandler{ .simple = .i64_trunc_sat_f32_u } },
+        .{ "i64.trunc_sat_f64_s", InstrHandler{ .simple = .i64_trunc_sat_f64_s } },
+        .{ "i64.trunc_sat_f64_u", InstrHandler{ .simple = .i64_trunc_sat_f64_u } },
     });
 
     fn parseInstr(self: *Parser, keyword: []const u8) !types.Instr {
