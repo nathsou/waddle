@@ -209,7 +209,7 @@ pub const Parser = struct {
     fn readTableType(self: *Parser) !types.TableType {
         const elem_type_n = try self.readByte();
         const elem_type = switch (elem_type_n) {
-            0x70 => return error.ReferenceTypesNotSupported,
+            0x70 => .funcref,
             else => return error.InvalidElemType,
         };
 

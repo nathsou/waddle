@@ -731,7 +731,7 @@ pub const Parser = struct {
     fn parseTableType(self: *Parser) !types.TableType {
         const limits = try self.parseLimits();
         try self.expectKeywordExact("funcref");
-        return .{ .elem_type = .func_ref, .limits = limits };
+        return .{ .elem_type = .funcref, .limits = limits };
     }
 
     fn parseMemType(self: *Parser) !types.MemType {

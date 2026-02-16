@@ -82,7 +82,7 @@ pub const MemType = struct {
 };
 
 pub const ElemType = enum {
-    func_ref,
+    funcref,
 };
 
 pub const TableType = struct {

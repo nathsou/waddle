@@ -30,7 +30,7 @@ pub const FlatInstr = union(enum) {
     br_table: BranchTableArg,
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
-    call_indirect: struct { func_type: *const types.FuncType, table: TableAddr },
+    call_indirect: struct { func_type: *const types.FuncType, table_addr: TableAddr },
     call_host: FuncAddr,
 
     // Super instructions
@@ -93,7 +93,7 @@ pub const FlatInstr = union(enum) {
     memory_grow: MemAddr,
     memory_init: struct { data_idx: DataAddr, mem: MemAddr },
     data_drop: DataAddr,
-    memory_copy: struct { dest_mem: MemAddr, src_mem: MemAddr },
+    memory_copy: struct { dst_mem: MemAddr, src_mem: MemAddr },
     memory_fill: MemAddr,
 
     // Numeric instructions
@@ -459,7 +459,7 @@ pub const FlatInstr = union(enum) {
             // Bulk memory operations
             .memory_init => |arg| try writer.print("memory.init data={d} mem={d}", .{ arg.data_idx, arg.mem }),
             .data_drop => |idx| try writer.print("data.drop {d}", .{idx}),
-            .memory_copy => |arg| try writer.print("memory.copy dest={d} src={d}", .{ arg.dest_mem, arg.src_mem }),
+            .memory_copy => |arg| try writer.print("memory.copy dest={d} src={d}", .{ arg.dst_mem, arg.src_mem }),
             .memory_fill => |mem| try writer.print("memory.fill mem={d}", .{mem}),
         }
     }
@@ -1257,7 +1257,7 @@ const BytecodeLowering = struct {
                 const table_addr = module_inst.table_addrs[arg.table_idx];
                 std.debug.assert(module_inst.types.len > arg.type_idx);
                 const func_type = &module_inst.types[arg.type_idx];
-                try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table = table_addr } });
+                try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table_addr = table_addr } });
             },
             .@"return" => {
                 if (self.current_func) |f| {
@@ -1323,7 +1323,7 @@ const BytecodeLowering = struct {
             .memory_copy => |arg| {
                 const src_mem_addr = self.current_func.?.module.mem_addrs[arg.src_mem_idx];
                 const dst_mem_addr = self.current_func.?.module.mem_addrs[arg.dst_mem_idx];
-                try self.emit(.{ .memory_copy = .{ .src_mem = src_mem_addr, .dest_mem = dst_mem_addr } });
+                try self.emit(.{ .memory_copy = .{ .src_mem = src_mem_addr, .dst_mem = dst_mem_addr } });
             },
             .memory_fill => |idx| {
                 const mem_addr = self.current_func.?.module.mem_addrs[idx];
@@ -2437,7 +2437,7 @@ pub const Runtime = struct {
         const effective_addr = @as(usize, @intCast(i)) + @as(usize, memarg.offset);
         const mem_inst = &self.store.mems.items[memarg.mem_addr];
 
-        if (effective_addr + N >= mem_inst.data.len) {
+        if (effective_addr + N > mem_inst.data.len) {
             return error.MemoryLoadOutOfBounds;
         }
 
@@ -2451,7 +2451,7 @@ pub const Runtime = struct {
         const effective_addr = @as(usize, @intCast(i)) + @as(usize, memarg.offset);
         const mem_inst = &self.store.mems.items[memarg.mem_addr];
 
-        if (effective_addr + N >= mem_inst.data.len) {
+        if (effective_addr + N > mem_inst.data.len) {
             return error.MemoryStoreOutOfBounds;
         }
 
@@ -2543,7 +2543,7 @@ pub const Runtime = struct {
                 },
                 .call_indirect => |call| {
                     const i: usize = @intCast(self.pop(i32));
-                    const table_inst = &self.store.tables.items[call.table];
+                    const table_inst = &self.store.tables.items[call.table_addr];
 
                     if (i >= table_inst.elem.len) {
                         return error.InvalidIndirectCallIndex;
@@ -2659,9 +2659,9 @@ pub const Runtime = struct {
                 },
                 .select => {
                     const condition = self.pop(i32);
-                    const a = try self.stack.popValue();
-                    const b = try self.stack.popValue();
-                    try self.stack.pushValue(if (condition != 0) a else b);
+                    const val2 = try self.stack.popValue();
+                    const val1 = try self.stack.popValue();
+                    try self.stack.pushValue(if (condition != 0) val1 else val2);
                 },
                 .local_get => |local_idx| {
                     const val = try self.getLocal(local_idx);
@@ -2960,8 +2960,31 @@ pub const Runtime = struct {
                 .data_drop => |_| {
                     return error.DataDropNotImplemented;
                 },
-                .memory_copy => |_| {
-                    return error.MemoryCopyNotImplemented;
+                .memory_copy => |arg| {
+                    const src_mem = &self.store.mems.items[arg.src_mem];
+                    const dst_mem = &self.store.mems.items[arg.dst_mem];
+                    const n: usize = @intCast(self.pop(i32));
+                    const src_start: usize = @intCast(self.pop(i32));
+                    const dst_start: usize = @intCast(self.pop(i32));
+                    const src_end = src_start + n;
+                    const dst_end = dst_start + n;
+
+                    if (src_end > src_mem.data.len or
+                        dst_end > dst_mem.data.len)
+                    {
+                        return error.MemoryCopyOutOfBounds;
+                    }
+
+                    if (n != 0) {
+                        const dst_slice = dst_mem.data[dst_start..dst_end];
+                        const src_slice = src_mem.data[src_start..src_end];
+
+                        if (arg.src_mem == arg.dst_mem) {
+                            @memmove(dst_slice, src_slice);
+                        } else {
+                            @memcpy(dst_slice, src_slice);
+                        }
+                    }
                 },
                 .memory_fill => |_| {
                     return error.MemoryFillNotImplemented;
