@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
@@ -1492,15 +1493,17 @@ const BytecodeLowering = struct {
 
 pub const Store = struct {
     allocator: Allocator,
+    host_ctx: ?*anyopaque,
     funcs: ArrayList(FuncInstance),
     tables: ArrayList(TableInstance),
     mems: ArrayList(MemoryInstance),
     datas: ArrayList(DataInstance),
     globals: ArrayList(GlobalInstance),
 
-    pub fn init(allocator: Allocator) Store {
+    pub fn init(allocator: Allocator, host_ctx: ?*anyopaque) Store {
         return Store{
             .allocator = allocator,
+            .host_ctx = host_ctx,
             .funcs = .empty,
             .tables = .empty,
             .mems = .empty,
@@ -1973,7 +1976,7 @@ const WasmFunc = struct {
     code: types.Func,
 };
 
-pub const HostFuncPtr = *const fn ([]const Value, *ModuleInstance, *Store) anyerror![]Value;
+pub const HostFuncPtr = *const fn (*ValueStack, *ModuleInstance, *Store) anyerror!void;
 
 pub const HostFunc = struct {
     type: types.FuncType,
@@ -2065,7 +2068,7 @@ fn FixedSizedStack(comptime T: type, Size: comptime_int) type {
     };
 }
 
-const ValueStack = struct {
+pub const ValueStack = struct {
     const Size = 16384;
     const Self = @This();
     values: [Size]u64,
@@ -2110,7 +2113,7 @@ const ValueStack = struct {
         };
     }
 
-    fn push(self: *Self, comptime T: type, val: T) !void {
+    pub fn push(self: *Self, comptime T: type, val: T) !void {
         if (self.top >= Size) {
             return error.StackOverflow;
         }
@@ -2120,7 +2123,7 @@ const ValueStack = struct {
         self.top += 1;
     }
 
-    fn pushValue(self: *Self, val: Value) !void {
+    pub fn pushValue(self: *Self, val: Value) !void {
         if (self.top >= Size) {
             return error.StackOverflow;
         }
@@ -2130,7 +2133,7 @@ const ValueStack = struct {
         self.top += 1;
     }
 
-    fn pop(self: *Self, comptime T: type) !T {
+    pub fn pop(self: *Self, comptime T: type) !T {
         if (self.top == 0) {
             return error.StackUnderflow;
         }
@@ -2142,7 +2145,7 @@ const ValueStack = struct {
         return decode(T, self.values[self.top]);
     }
 
-    fn popValue(self: *Self) !Value {
+    pub fn popValue(self: *Self) !Value {
         if (self.top == 0) {
             return error.StackUnderflow;
         }
@@ -2158,6 +2161,23 @@ const ValueStack = struct {
             .f32 => .{ .f32 = decode(f32, val) },
             .f64 => .{ .f64 = decode(f64, val) },
         };
+    }
+
+    pub fn popValues(self: *Self, allocator: Allocator, count: usize) ![]Value {
+        if (self.top < count) {
+            return error.StackUnderflow;
+        }
+
+        self.top -= count;
+
+        const vals = try allocator.alloc(Value, count);
+        errdefer self.allocator.free(vals);
+
+        for (vals, 0..) |*val, i| {
+            val.* = self.getValue(self.top + i);
+        }
+
+        return vals;
     }
 
     fn getValue(self: *const Self, idx: usize) Value {
@@ -2226,6 +2246,8 @@ pub const Runtime = struct {
     pub fn invokeStartFunc(self: *Runtime) !void {
         if (self.start_func_addr) |addr| {
             _ = try self.invokeFunc(addr);
+        } else {
+            return error.NoStartFunction;
         }
     }
 
@@ -2245,15 +2267,15 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn invokeExportedFunc(self: *Runtime, export_name: types.Name, args: []const Value) ![]Value {
+    pub fn invokeExportedFunc(self: *Runtime, allocator: Allocator, export_name: types.Name, args: []const Value) ![]Value {
         const exp = try self.getExportByName(export_name);
         return switch (exp) {
-            .func => |func_addr| self.invokeFuncWithArgs(func_addr, args),
+            .func => |func_addr| self.invokeFuncWithArgs(allocator, func_addr, args),
             else => return error.ExportNotAFunction,
         };
     }
 
-    pub fn invokeFuncWithArgs(self: *Runtime, func_addr: FuncAddr, args: []const Value) ![]Value {
+    pub fn invokeFuncWithArgs(self: *Runtime, allocator: Allocator, func_addr: FuncAddr, args: []const Value) ![]Value {
         const old_stack_top = self.stack.top;
         errdefer self.stack.top = old_stack_top;
 
@@ -2261,10 +2283,14 @@ pub const Runtime = struct {
             try self.pushValue(arg);
         }
 
-        return try self.invokeFunc(func_addr);
+        const results_count = try self.invokeFunc(func_addr);
+
+        return try self.stack.popValues(allocator, results_count);
     }
 
-    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr) ![]Value {
+    /// Invokes the function at `func_addr`, assuming its arguments are already on the stack.
+    /// Returns the number of results specified by the function type, which will be on top of the stack after invocation.
+    pub fn invokeFunc(self: *Runtime, func_addr: FuncAddr) !usize {
         const func_inst = self.store.funcs.items[func_addr];
         const func_type = func_inst.getType();
 
@@ -2280,8 +2306,11 @@ pub const Runtime = struct {
             }
         }
 
+        var results_count: usize = 0;
+
         switch (func_inst) {
             .wasm => |*wasm_func| {
+                results_count = wasm_func.type.results.len;
                 const base_ptr = args_start;
 
                 // Locals are initialized by bytecode instructions emitted during lowering
@@ -2295,35 +2324,20 @@ pub const Runtime = struct {
 
                 if (self.bytecode.functions[func_addr]) |entry_pc| {
                     try self.execute(entry_pc);
-                    var result: []Value = &[_]Value{};
-                    if (wasm_func.type.results.len > 0) {
-                        const result_count = wasm_func.type.results.len;
-                        const result_start = self.stack.top - result_count;
-                        result = try self.allocator.alloc(Value, result_count);
-                        for (0..result_count) |i| {
-                            result[i] = self.stack.getValue(result_start + i);
-                        }
-                    }
 
                     self.stack.top = base_ptr;
-
-                    return result;
                 } else {
                     return error.FunctionNotFound;
                 }
             },
             .host => |host_func| {
-                const arg_count = func_type.params.len;
-                const args = try self.allocator.alloc(Value, arg_count);
-                defer self.allocator.free(args);
-                for (0..arg_count) |i| {
-                    args[i] = self.stack.getValue(args_start + i);
-                }
-                const res = try host_func.code(args, self.module, &self.store);
+                results_count = host_func.type.results.len;
+                try host_func.code(&self.stack, self.module, &self.store);
                 self.stack.top = args_start;
-                return res;
             },
         }
+
+        return results_count;
     }
 
     inline fn push(self: *Runtime, comptime T: type, val: T) !void {
@@ -2387,6 +2401,7 @@ pub const Runtime = struct {
             const len = self.stack.top;
             const results_start = len - 1;
             @memmove(self.stack.values[frame.base_ptr .. frame.base_ptr + 1], self.stack.values[results_start..len]);
+            @memmove(self.stack.types[frame.base_ptr .. frame.base_ptr + 1], self.stack.types[results_start..len]);
             self.stack.top = frame.base_ptr + 1;
             pc.* = return_pc;
             self.call_stack.top -= 1;
@@ -2534,6 +2549,7 @@ pub const Runtime = struct {
                             const len = self.stack.top;
                             const results_start = len - arity;
                             @memmove(self.stack.values[frame.base_ptr .. frame.base_ptr + arity], self.stack.values[results_start..len]);
+                            @memmove(self.stack.types[frame.base_ptr .. frame.base_ptr + arity], self.stack.types[results_start..len]);
                             self.stack.top = frame.base_ptr + arity;
                         }
 
@@ -2557,20 +2573,23 @@ pub const Runtime = struct {
                     }
 
                     const host_func = &self.store.funcs.items[host_func_addr].host;
-                    const arg_count = host_func.type.params.len;
-                    const args = try self.allocator.alloc(Value, arg_count);
-                    defer self.allocator.free(args);
-                    const args_start = self.stack.top - arg_count;
+                    const stack_size_before = self.stack.top;
+                    const func_type = host_func.type;
+                    const expected_stack_size_after = stack_size_before + func_type.results.len - func_type.params.len;
 
-                    for (0..arg_count) |i| {
-                        args[i] = self.stack.getValue(args_start + i);
-                    }
+                    try host_func.code(&self.stack, self.module, &self.store);
 
-                    self.stack.top -= arg_count;
-                    const results = try host_func.code(args, self.module, &self.store);
+                    if (builtin.mode == .Debug) {
+                        // validate that host func returned the expected number of results and that they are of the expected types
+                        if (self.stack.top != expected_stack_size_after) {
+                            return error.InvalidHostFuncReturnCount;
+                        }
 
-                    for (results) |val| {
-                        try self.pushValue(val);
+                        for (func_type.results, 0..) |result_type, i| {
+                            if (self.stack.types[stack_size_before + i] != result_type) {
+                                return error.InvalidHostFuncReturnType;
+                            }
+                        }
                     }
                 },
                 .call_indirect => |call| {

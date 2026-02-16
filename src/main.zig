@@ -6,6 +6,23 @@ const wat = waddle.wat;
 const runtime = waddle.runtime;
 const types = waddle.types;
 
+const source =
+    \\int fib(int arg0);
+    \\
+    \\int main(void) {
+    \\    int n = 11;
+    \\    return fib(n);
+    \\}
+    \\
+    \\int fib(int n) {
+    \\    if (n == 0 || n == 1) {
+    \\        return n;
+    \\    } else {
+    \\        return fib(n - 1) + fib(n - 2);
+    \\    }
+    \\}
+;
+
 pub fn main() !void {
     if (builtin.mode == .Debug) {
         var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
@@ -56,7 +73,15 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    var vm = try createVM(arena.allocator(), wasm_path.?);
+    var host_env = HostEnv.init(allocator, source);
+    defer host_env.deinit();
+    defer {
+        for (host_env.outputs.items) |output| {
+            std.debug.print("{s}", .{output});
+        }
+    }
+
+    var vm = try createVM(arena.allocator(), wasm_path.?, &host_env);
     defer vm.deinit();
 
     if (print_bytecode) {
@@ -86,12 +111,13 @@ fn run(allocator: std.mem.Allocator) !void {
             return;
         }
 
-        const func_args = try arena.allocator().alloc(types.Value, func_type.params.len);
+        const func_args = try allocator.alloc(types.Value, func_type.params.len);
+        defer allocator.free(func_args);
         for (func_type.params, 0..) |param_type, i| {
             func_args[i] = try parseValue(func_arg_strings[i], param_type);
         }
 
-        const results = try vm.invokeExportedFunc(func_name, func_args);
+        const results = try vm.invokeExportedFunc(allocator, func_name, func_args);
 
         for (results, 0..) |res, i| {
             std.debug.print("{f}", .{res});
@@ -127,17 +153,70 @@ fn printUsage(program_name: []const u8) void {
     );
 }
 
-const host_env = struct {
-    fn printChar(args: []const types.Value, _: *runtime.ModuleInstance, _: *runtime.Store) ![]types.Value {
-        const char_code: u8 = @intCast(args[0].i32);
-        std.debug.print("{c}", .{char_code});
-        return &.{};
+// host imports to run compote
+// https://github.com/nathsou/compote/blob/776f5270005606eae7a10373504f59bf79e27cf1/src/main.rs
+const HostEnv = struct {
+    preprocessed: []const u8,
+    outputs: std.ArrayList([]const u8),
+    output_buffer: std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator, preprocessed: []const u8) HostEnv {
+        return HostEnv{
+            .allocator = allocator,
+            .preprocessed = preprocessed,
+            .outputs = .empty,
+            .output_buffer = .empty,
+        };
+    }
+
+    fn deinit(self: *HostEnv) void {
+        self.output_buffer.deinit(self.allocator);
+
+        for (self.outputs.items) |output| {
+            self.allocator.free(output);
+        }
+
+        self.outputs.deinit(self.allocator);
+    }
+
+    fn printChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
+        const char_code: u8 = @intCast(try stack.pop(i32));
+        _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
+    }
+
+    fn outputChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
+        const ctx: *HostEnv = @ptrCast(@alignCast(store.host_ctx));
+        const done = try stack.pop(i32);
+        const char: u8 = @intCast(try stack.pop(i32));
+        try ctx.output_buffer.append(ctx.allocator, char);
+
+        if (done != 0) {
+            try ctx.outputs.append(ctx.allocator, try ctx.output_buffer.toOwnedSlice(ctx.allocator));
+            ctx.output_buffer.items.len = 0;
+        }
+    }
+
+    fn getSourceFileLength(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
+        const ctx: *HostEnv = @ptrCast(@alignCast(store.host_ctx));
+        try stack.push(i32, @intCast(ctx.preprocessed.len));
+    }
+
+    fn readSourceFileChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
+        const ctx: *HostEnv = @ptrCast(@alignCast(store.host_ctx));
+        const idx: usize = @intCast(try stack.pop(i32));
+
+        if (idx >= ctx.preprocessed.len) {
+            return error.SourceFileCharIndexOutOfBounds;
+        }
+
+        const char: i32 = @intCast(ctx.preprocessed[idx]);
+        try stack.push(i32, char);
     }
 };
 
-fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runtime {
-    var store = runtime.Store.init(allocator);
-
+fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_env: *HostEnv) !runtime.Runtime {
+    var store = runtime.Store.init(allocator, @ptrCast(host_env));
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
     var file_read_buffer: [4096]u8 = undefined;
@@ -173,7 +252,22 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8) !runtime.Runt
         .{
             .module = "spectest",
             .name = "print_char",
-            .value = .{ .func = host_env.printChar },
+            .value = .{ .func = HostEnv.printChar },
+        },
+        .{
+            .module = "host",
+            .name = "get_source_file_length",
+            .value = .{ .func = HostEnv.getSourceFileLength },
+        },
+        .{
+            .module = "host",
+            .name = "read_source_file_char",
+            .value = .{ .func = HostEnv.readSourceFileChar },
+        },
+        .{
+            .module = "host",
+            .name = "output_char",
+            .value = .{ .func = HostEnv.outputChar },
         },
     });
 
