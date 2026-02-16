@@ -2487,15 +2487,8 @@ pub const Runtime = struct {
     }
 
     fn truncSat(comptime Dst: type, comptime Src: type, val: Src) Dst {
-        const truncated: Dst = @intFromFloat(val);
-
-        if (truncated < std.math.minInt(Dst)) {
-            return std.math.minInt(Dst);
-        } else if (truncated > std.math.maxInt(Dst)) {
-            return std.math.maxInt(Dst);
-        } else {
-            return truncated;
-        }
+        if (std.math.isNan(val)) return 0;
+        return std.math.clamp(@as(Dst, @intFromFloat(val)), std.math.minInt(Dst), std.math.maxInt(Dst));
     }
 
     pub fn execute(self: *Runtime, start_pc: usize) !void {
