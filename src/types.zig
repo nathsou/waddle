@@ -12,6 +12,7 @@ pub const MemIndex = u32;
 pub const GlobalIndex = u32;
 pub const LocalIndex = u32;
 pub const LabelIndex = u32;
+pub const DataIndex = u32;
 
 pub const Name = []const u8;
 
@@ -163,6 +164,10 @@ pub const Instr = union(enum) {
     i64_store32: MemoryInstrArg,
     memory_size: MemIndex,
     memory_grow: MemIndex,
+    memory_init: struct { data_idx: DataIndex, mem_idx: MemIndex },
+    data_drop: DataIndex,
+    memory_copy: struct { dst_mem_idx: MemIndex, src_mem_idx: MemIndex },
+    memory_fill: MemIndex,
 
     // Numeric instructions
     i32_const: i32,
@@ -342,10 +347,14 @@ pub const Func = struct {
 
 pub const Code = Func;
 
+pub const DataMode = union(enum) {
+    active: struct { mem_idx: MemIndex, offset: Expr },
+    passive,
+};
+
 pub const Data = struct {
-    mem: MemIndex,
-    offset: Expr,
-    init: []const Byte,
+    init: []Byte,
+    mode: DataMode,
 };
 
 pub const CustomSection = struct {

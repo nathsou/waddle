@@ -12,7 +12,7 @@ const PC = usize;
 const MemArg = struct {
     alignment: u32,
     offset: u32,
-    mem: *const MemoryInstance,
+    mem_addr: MemAddr,
 };
 
 const BranchTableArg = struct {
@@ -30,7 +30,7 @@ pub const FlatInstr = union(enum) {
     br_table: BranchTableArg,
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
-    call_indirect: struct { func_type: *const types.FuncType, table: *const TableInstance },
+    call_indirect: struct { func_type: *const types.FuncType, table: TableAddr },
     call_host: FuncAddr,
 
     // Super instructions
@@ -62,8 +62,8 @@ pub const FlatInstr = union(enum) {
     local_get: LocalIndex,
     local_set: LocalIndex,
     local_tee: LocalIndex,
-    global_get: *const GlobalInstance,
-    global_set: *GlobalInstance,
+    global_get: GlobalAddr,
+    global_set: GlobalAddr,
 
     // Memory instructions
     i32_load: MemArg,
@@ -89,8 +89,12 @@ pub const FlatInstr = union(enum) {
     i64_store8: MemArg,
     i64_store16: MemArg,
     i64_store32: MemArg,
-    memory_size: *const MemoryInstance,
-    memory_grow: *MemoryInstance,
+    memory_size: MemAddr,
+    memory_grow: MemAddr,
+    memory_init: struct { data_idx: DataAddr, mem: MemAddr },
+    data_drop: DataAddr,
+    memory_copy: struct { dest_mem: MemAddr, src_mem: MemAddr },
+    memory_fill: MemAddr,
 
     // Numeric instructions
     i32_const: i32,
@@ -451,6 +455,12 @@ pub const FlatInstr = union(enum) {
             .i64_extend8_s => try writer.writeAll("i64.extend8_s"),
             .i64_extend16_s => try writer.writeAll("i64.extend16_s"),
             .i64_extend32_s => try writer.writeAll("i64.extend32_s"),
+
+            // Bulk memory operations
+            .memory_init => |arg| try writer.print("memory.init data={d} mem={d}", .{ arg.data_idx, arg.mem }),
+            .data_drop => |idx| try writer.print("data.drop {d}", .{idx}),
+            .memory_copy => |arg| try writer.print("memory.copy dest={d} src={d}", .{ arg.dest_mem, arg.src_mem }),
+            .memory_fill => |mem| try writer.print("memory.fill mem={d}", .{mem}),
         }
     }
 };
@@ -1073,7 +1083,7 @@ const BytecodeLowering = struct {
         return MemArg{
             .alignment = memarg.alignment,
             .offset = memarg.offset,
-            .mem = &self.store.mems.items[mem_addr],
+            .mem_addr = mem_addr,
         };
     }
 
@@ -1245,10 +1255,9 @@ const BytecodeLowering = struct {
                 std.debug.assert(self.current_func.?.module.table_addrs.len > arg.table_idx);
                 const module_inst = self.current_func.?.module;
                 const table_addr = module_inst.table_addrs[arg.table_idx];
-                const table_inst = &self.store.tables.items[table_addr];
                 std.debug.assert(module_inst.types.len > arg.type_idx);
                 const func_type = &module_inst.types[arg.type_idx];
-                try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table = table_inst } });
+                try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table = table_addr } });
             },
             .@"return" => {
                 if (self.current_func) |f| {
@@ -1265,11 +1274,10 @@ const BytecodeLowering = struct {
             .global_get, .global_set => |idx| {
                 std.debug.assert(self.current_func.?.module.global_addrs.len > idx);
                 const global_addr = self.current_func.?.module.global_addrs[idx];
-                const global_inst = &self.store.globals.items[global_addr];
 
                 switch (instr) {
-                    .global_get => try self.emit(.{ .global_get = global_inst }),
-                    else => try self.emit(.{ .global_set = global_inst }),
+                    .global_get => try self.emit(.{ .global_get = global_addr }),
+                    else => try self.emit(.{ .global_set = global_addr }),
                 }
             },
             .i32_load => |arg| try self.emit(.{ .i32_load = self.memArg(arg) }),
@@ -1297,11 +1305,29 @@ const BytecodeLowering = struct {
             .i64_store32 => |arg| try self.emit(.{ .i64_store32 = self.memArg(arg) }),
             .memory_size => |idx| {
                 const mem_addr = self.current_func.?.module.mem_addrs[idx];
-                try self.emit(.{ .memory_size = &self.store.mems.items[mem_addr] });
+                try self.emit(.{ .memory_size = mem_addr });
             },
             .memory_grow => |idx| {
                 const mem_addr = self.current_func.?.module.mem_addrs[idx];
-                try self.emit(.{ .memory_grow = &self.store.mems.items[mem_addr] });
+                try self.emit(.{ .memory_grow = mem_addr });
+            },
+            .memory_init => |arg| {
+                const data_addr = self.current_func.?.module.data_addrs[arg.data_idx];
+                const mem_addr = self.current_func.?.module.mem_addrs[arg.mem_idx];
+                try self.emit(.{ .memory_init = .{ .data_idx = data_addr, .mem = mem_addr } });
+            },
+            .data_drop => |idx| {
+                const data_addr = self.current_func.?.module.data_addrs[idx];
+                try self.emit(.{ .data_drop = data_addr });
+            },
+            .memory_copy => |arg| {
+                const src_mem_addr = self.current_func.?.module.mem_addrs[arg.src_mem_idx];
+                const dst_mem_addr = self.current_func.?.module.mem_addrs[arg.dst_mem_idx];
+                try self.emit(.{ .memory_copy = .{ .src_mem = src_mem_addr, .dest_mem = dst_mem_addr } });
+            },
+            .memory_fill => |idx| {
+                const mem_addr = self.current_func.?.module.mem_addrs[idx];
+                try self.emit(.{ .memory_fill = mem_addr });
             },
             .i32_const => |n| try self.emit(.{ .i32_const = n }),
             .i64_const => |n| try self.emit(.{ .i64_const = n }),
@@ -1444,6 +1470,7 @@ pub const Store = struct {
     funcs: ArrayList(FuncInstance),
     tables: ArrayList(TableInstance),
     mems: ArrayList(MemoryInstance),
+    datas: ArrayList(DataInstance),
     globals: ArrayList(GlobalInstance),
 
     pub fn init(allocator: Allocator) Store {
@@ -1452,6 +1479,7 @@ pub const Store = struct {
             .funcs = .empty,
             .tables = .empty,
             .mems = .empty,
+            .datas = .empty,
             .globals = .empty,
         };
     }
@@ -1468,6 +1496,7 @@ pub const Store = struct {
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.mems.deinit(self.allocator);
+        self.datas.deinit(self.allocator);
         self.globals.deinit(self.allocator);
     }
 
@@ -1498,6 +1527,8 @@ pub const Store = struct {
         errdefer allocator.free(table_addrs);
         const mem_addrs = try allocator.alloc(MemAddr, num_mem_extern_vals + module.memories.len);
         errdefer allocator.free(mem_addrs);
+        const data_addrs = try allocator.alloc(DataAddr, module.data.len);
+        errdefer allocator.free(data_addrs);
         const global_addrs = try allocator.alloc(GlobalAddr, num_global_extern_vals + module.globals.len);
         errdefer allocator.free(global_addrs);
         const exports = try allocator.alloc(ExportInstance, module.exports.len);
@@ -1511,6 +1542,7 @@ pub const Store = struct {
             .func_addrs = func_addrs,
             .table_addrs = table_addrs,
             .mem_addrs = mem_addrs,
+            .data_addrs = data_addrs,
             .global_addrs = global_addrs,
             .exports = exports,
             .exports_by_name = .init(allocator),
@@ -1845,31 +1877,34 @@ pub const Store = struct {
 
         // Initialise data segments
         for (module.data) |data| {
-            const offset_val = try self.evalConstExpr(global_extern_vals, data.offset);
-            const offset = switch (offset_val) {
-                .i32 => |n| blk: {
-                    if (n < 0) {
-                        return error.InvalidDataSegmentOffset;
+            switch (data.mode) {
+                .passive => {},
+                .active => |active_mode| {
+                    const offset_val = try self.evalConstExpr(global_extern_vals, active_mode.offset);
+                    const offset = switch (offset_val) {
+                        .i32 => |n| blk: {
+                            if (n < 0) {
+                                return error.InvalidDataSegmentOffset;
+                            }
+
+                            break :blk @as(usize, @as(u32, @bitCast(n)));
+                        },
+                        else => return error.InvalidDataSegmentOffset,
+                    };
+
+                    const mem_idx_usize = @as(usize, active_mode.mem_idx);
+                    if (mem_idx_usize >= module_inst.mem_addrs.len) {
+                        return error.InvalidMemIndex;
                     }
 
-                    break :blk @as(usize, @as(u32, @bitCast(n)));
+                    const mem_addr = module_inst.mem_addrs[mem_idx_usize];
+                    const mem_inst = self.mems.items[mem_addr];
+                    if (offset + data.init.len > mem_inst.data.len) {
+                        return error.DataSegmentOutOfBounds;
+                    }
+
+                    @memcpy(mem_inst.data[offset .. offset + data.init.len], data.init);
                 },
-                else => return error.InvalidDataSegmentOffset,
-            };
-
-            const mem_idx_usize = @as(usize, data.mem);
-            if (mem_idx_usize >= module_inst.mem_addrs.len) {
-                return error.InvalidMemIndex;
-            }
-
-            const mem_addr = module_inst.mem_addrs[mem_idx_usize];
-            const mem_inst = self.mems.items[mem_addr];
-            if (offset + data.init.len > mem_inst.data.len) {
-                return error.DataSegmentOutOfBounds;
-            }
-
-            for (data.init, 0..) |byte, i| {
-                mem_inst.data[offset + i] = byte;
             }
         }
 
@@ -1881,6 +1916,7 @@ pub const Addr = usize;
 pub const FuncAddr = Addr;
 pub const TableAddr = Addr;
 pub const MemAddr = Addr;
+pub const DataAddr = Addr;
 pub const GlobalAddr = Addr;
 
 pub const ModuleInstance = struct {
@@ -1888,6 +1924,7 @@ pub const ModuleInstance = struct {
     func_addrs: []FuncAddr,
     table_addrs: []TableAddr,
     mem_addrs: []MemAddr,
+    data_addrs: []DataAddr,
     global_addrs: []GlobalAddr,
     exports: []ExportInstance,
     exports_by_name: std.StringHashMap(ExternVal),
@@ -1896,6 +1933,7 @@ pub const ModuleInstance = struct {
         allocator.free(self.func_addrs);
         allocator.free(self.table_addrs);
         allocator.free(self.mem_addrs);
+        allocator.free(self.data_addrs);
         allocator.free(self.global_addrs);
         allocator.free(self.exports);
         self.exports_by_name.deinit();
@@ -1944,6 +1982,10 @@ const MemoryInstance = struct {
 const GlobalInstance = struct {
     value: Value,
     mutable: bool,
+};
+
+const DataInstance = struct {
+    data: []types.Byte,
 };
 
 const ExportInstance = struct {
@@ -2011,7 +2053,7 @@ const ValueStack = struct {
         };
     }
 
-    fn matching_val_type(comptime T: type) types.ValType {
+    fn matchingValType(comptime T: type) types.ValType {
         return switch (T) {
             i32 => types.ValType.i32,
             i64 => types.ValType.i64,
@@ -2047,7 +2089,7 @@ const ValueStack = struct {
         }
 
         self.values[self.top] = encode(T, val);
-        self.types[self.top] = matching_val_type(T);
+        self.types[self.top] = matchingValType(T);
         self.top += 1;
     }
 
@@ -2068,7 +2110,7 @@ const ValueStack = struct {
 
         self.top -= 1;
 
-        std.debug.assert(self.types[self.top] == matching_val_type(T));
+        std.debug.assert(self.types[self.top] == matchingValType(T));
 
         return decode(T, self.values[self.top]);
     }
@@ -2393,12 +2435,13 @@ pub const Runtime = struct {
         const i = self.pop(i32);
         const N = @divExact(@typeInfo(T).int.bits, 8);
         const effective_addr = @as(usize, @intCast(i)) + @as(usize, memarg.offset);
+        const mem_inst = &self.store.mems.items[memarg.mem_addr];
 
-        if (effective_addr + N >= memarg.mem.data.len) {
-            return error.MemoryAccessOutOfBounds;
+        if (effective_addr + N >= mem_inst.data.len) {
+            return error.MemoryLoadOutOfBounds;
         }
 
-        const bytes = memarg.mem.data[effective_addr .. effective_addr + N];
+        const bytes = mem_inst.data[effective_addr .. effective_addr + N];
         return std.mem.readInt(T, bytes[0..N], .little);
     }
 
@@ -2406,12 +2449,13 @@ pub const Runtime = struct {
         const i = self.pop(i32);
         const N = @divExact(@typeInfo(T).int.bits, 8);
         const effective_addr = @as(usize, @intCast(i)) + @as(usize, memarg.offset);
+        const mem_inst = &self.store.mems.items[memarg.mem_addr];
 
-        if (effective_addr + N >= memarg.mem.data.len) {
-            return error.MemoryAccessOutOfBounds;
+        if (effective_addr + N >= mem_inst.data.len) {
+            return error.MemoryStoreOutOfBounds;
         }
 
-        const bytes = memarg.mem.data[effective_addr .. effective_addr + N];
+        const bytes = mem_inst.data[effective_addr .. effective_addr + N];
         std.mem.writeInt(T, bytes[0..N], val, .little);
     }
 
@@ -2499,12 +2543,13 @@ pub const Runtime = struct {
                 },
                 .call_indirect => |call| {
                     const i: usize = @intCast(self.pop(i32));
+                    const table_inst = &self.store.tables.items[call.table];
 
-                    if (i >= call.table.elem.len) {
+                    if (i >= table_inst.elem.len) {
                         return error.InvalidIndirectCallIndex;
                     }
 
-                    if (call.table.elem[i]) |func_addr| {
+                    if (table_inst.elem[i]) |func_addr| {
                         const func_inst = self.store.funcs.items[func_addr];
 
                         if (!func_inst.getType().eql(call.func_type.*)) {
@@ -2630,11 +2675,13 @@ pub const Runtime = struct {
                     const val = try self.peek();
                     try self.setLocal(local_idx, val);
                 },
-                .global_get => |global_inst| {
+                .global_get => |global_addr| {
+                    const global_inst = &self.store.globals.items[global_addr];
                     try self.stack.pushValue(global_inst.value);
                 },
-                .global_set => |global_inst| {
+                .global_set => |global_addr| {
                     const val = self.popValue();
+                    const global_inst = &self.store.globals.items[global_addr];
                     std.debug.assert(global_inst.mutable);
                     global_inst.value = val;
                 },
@@ -2878,12 +2925,14 @@ pub const Runtime = struct {
                     const val = self.pop(i64);
                     try self.memStore(u32, memarg, @truncate(@as(u64, @bitCast(val))));
                 },
-                .memory_size => |mem_inst| {
+                .memory_size => |mem_addr| {
+                    const mem_inst = &self.store.mems.items[mem_addr];
                     const size: i32 = @intCast(mem_inst.data.len / page_size);
                     try self.push(i32, size);
                 },
-                .memory_grow => |mem_inst| {
+                .memory_grow => |mem_addr| {
                     const n: u32 = @bitCast(self.pop(i32));
+                    const mem_inst = &self.store.mems.items[mem_addr];
                     const old_pages: u32 = @intCast(mem_inst.data.len / page_size);
                     const new_pages: u64 = @as(u64, old_pages) + @as(u64, n);
                     var result: i32 = -1;
@@ -2904,6 +2953,18 @@ pub const Runtime = struct {
                     }
 
                     try self.push(i32, result);
+                },
+                .memory_init => |_| {
+                    return error.MemoryInitNotImplemented;
+                },
+                .data_drop => |_| {
+                    return error.DataDropNotImplemented;
+                },
+                .memory_copy => |_| {
+                    return error.MemoryCopyNotImplemented;
+                },
+                .memory_fill => |_| {
+                    return error.MemoryFillNotImplemented;
                 },
                 .i64_eqz => {
                     const val = self.pop(i64);

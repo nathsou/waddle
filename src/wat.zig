@@ -1141,45 +1141,86 @@ pub const Parser = struct {
     }
 
     fn parseDataField(self: *Parser) !types.Data {
-        // (data memidx? (offset expr) datastring)
-        var mem_idx: u32 = 0;
+        // Bulk Memory Operations format:
+        // (data id? datastring) -> passive
+        // (data id? (memory memidx) (offset expr) datastring) -> active
+        // Legacy formats (also supported):
+        // (data id? (expr) datastring) -> active (abbreviated offset)
+        // (data id? (offset instr...) datastring) -> active (flat offset)
 
-        // Try optional memory index
-        if (!self.isAt(.lparen) and !self.isAt(.string)) {
-            if (self.isAt(.integer) or self.isAt(.id)) {
+        var mem_idx: u32 = 0;
+        var offset_expr: ?[]types.Instr = null;
+
+        // 1. Parse optional ID (data segment identifier)
+        _ = try self.optionalId();
+
+        // 2. Check for (memory memidx) clause
+        if (self.isAt(.lparen)) {
+            const saved_pos = self.lexer.pos;
+            const saved_current = self.current;
+            _ = try self.expect(.lparen);
+
+            if (self.isKeyword("memory")) {
+                // (memory memidx) -> Active mode
+                try self.advance();
                 mem_idx = try self.resolveMem();
+                _ = try self.expect(.rparen);
+            } else {
+                // Not a memory clause, restore position
+                self.lexer.pos = saved_pos;
+                self.current = saved_current;
             }
         }
 
-        // Parse offset expression
-        _ = try self.expect(.lparen);
+        // 3. Check for offset expression
+        if (self.isAt(.lparen)) {
+            const saved_pos = self.lexer.pos;
+            const saved_current = self.current;
+            _ = try self.expect(.lparen);
 
-        var offset: []types.Instr = undefined;
-        if (self.isKeyword("offset")) {
-            try self.advance();
-            offset = try self.parseExpr();
-        } else {
+            if (self.isKeyword("offset")) {
+                // (offset expr) -> Active mode with proper offset clause
+                try self.advance();
+                offset_expr = try self.parseExpr();
+                _ = try self.expect(.rparen);
+            } else {
+                // Legacy abbreviated format: bare folded instruction like (i32.const 0)
+                // This is the offset expression
+                self.lexer.pos = saved_pos;
+                self.current = saved_current;
+                var instrs: ArrayList(types.Instr) = .empty;
+                try self.parseFoldedInstr(&instrs);
+                offset_expr = try instrs.toOwnedSlice(self.allocator);
+            }
+        } else if (self.isKeyword("offset")) {
+            // Legacy flat format: (data (offset i32.const 0) "...")
+            // Parse flat instruction sequence as offset
+            try self.advance(); // consume "offset"
             var instrs: ArrayList(types.Instr) = .empty;
-            try self.parseOneInstr(&instrs);
-            offset = try instrs.toOwnedSlice(self.allocator);
+            try self.parsePlainInstr(&instrs);
+            offset_expr = try instrs.toOwnedSlice(self.allocator);
         }
-        _ = try self.expect(.rparen);
 
-        // Parse data string(s)
+        // 4. Parse data strings
         var data_bytes: ArrayList(u8) = .empty;
         while (self.isAt(.string)) {
             const raw = try self.expectString();
-            try self.decodeString(raw, &data_bytes);
+            try self.decodeDataString(raw, &data_bytes);
         }
 
+        // 5. Construct the Data segment with appropriate mode
+        const mode: types.DataMode = if (offset_expr) |offset|
+            .{ .active = .{ .mem_idx = mem_idx, .offset = offset } }
+        else
+            .passive;
+
         return .{
-            .mem = mem_idx,
-            .offset = offset,
             .init = try data_bytes.toOwnedSlice(self.allocator),
+            .mode = mode,
         };
     }
 
-    fn decodeString(self: *Parser, raw: []const u8, out: *ArrayList(u8)) !void {
+    fn decodeDataString(self: *Parser, raw: []const u8, out: *ArrayList(u8)) !void {
         var i: usize = 0;
         while (i < raw.len) {
             if (raw[i] == '\\') {

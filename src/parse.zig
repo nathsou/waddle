@@ -137,6 +137,7 @@ pub const Parser = struct {
             0x7E => .i64,
             0x7D => .f32,
             0x7C => .f64,
+            0x70, 0x6F => return error.ReferenceTypesNotSupported,
             else => return error.InvalidValType,
         };
     }
@@ -147,9 +148,17 @@ pub const Parser = struct {
         if (n == 0x40) {
             self.index += 1; // consume the byte
             return .empty;
-        } else {
-            const val_type = try self.readValType();
-            return .{ .val_type = val_type };
+        }
+
+        switch (n) {
+            0x7F, 0x7E, 0x7D, 0x7C, 0x70, 0x6F => {
+                const val_type = try self.readValType();
+                return .{ .val_type = val_type };
+            },
+            else => {
+                const type_idx = try self.readU32();
+                return .{ .type_index = @intCast(type_idx) };
+            },
         }
     }
 
@@ -200,7 +209,7 @@ pub const Parser = struct {
     fn readTableType(self: *Parser) !types.TableType {
         const elem_type_n = try self.readByte();
         const elem_type = switch (elem_type_n) {
-            0x70 => .func_ref,
+            0x70 => return error.ReferenceTypesNotSupported,
             else => return error.InvalidElemType,
         };
 
@@ -298,15 +307,32 @@ pub const Parser = struct {
     }
 
     fn readData(self: *Parser) !types.Data {
-        const mem_idx = try self.readU32();
-        const offset_expr = try self.readExpr();
-        const init_bytes = try self.readVector(types.Byte, readByte);
+        const mode_n = try self.readU32();
 
-        return .{
-            .mem = mem_idx,
-            .offset = offset_expr,
-            .init = init_bytes,
-        };
+        switch (mode_n) {
+            0, 2 => {
+                const mem_idx = if (mode_n == 0) 0 else try self.readU32();
+                const offset = try self.readExpr();
+                const init_bytes = try self.readVector(types.Byte, readByte);
+                return types.Data{
+                    .init = init_bytes,
+                    .mode = types.DataMode{
+                        .active = .{
+                            .mem_idx = mem_idx,
+                            .offset = offset,
+                        },
+                    },
+                };
+            },
+            1 => {
+                const init_bytes = try self.readVector(types.Byte, readByte);
+                return types.Data{
+                    .init = init_bytes,
+                    .mode = .passive,
+                };
+            },
+            else => return error.InvalidDataMode,
+        }
     }
 
     const SequenceResult = struct {
@@ -437,7 +463,7 @@ pub const Parser = struct {
                 const reserved = try self.readByte();
 
                 if (reserved != 0x00) {
-                    return error.InvalidMemoryInstruction;
+                    return error.InvalidMemorySizeInstruction;
                 }
 
                 return .{ .memory_size = @intCast(reserved) };
@@ -446,7 +472,7 @@ pub const Parser = struct {
                 const reserved = try self.readByte();
 
                 if (reserved != 0x00) {
-                    return error.InvalidMemoryInstruction;
+                    return error.InvalidMemoryGrowInstruction;
                 }
 
                 return .{ .memory_grow = @intCast(reserved) };
@@ -583,7 +609,33 @@ pub const Parser = struct {
             0xC2 => .i64_extend8_s,
             0xC3 => .i64_extend16_s,
             0xC4 => .i64_extend32_s,
+            0xFC => {
+                const op = try self.readU32();
 
+                switch (op) {
+                    8 => {
+                        const data_idx = try self.readU32();
+                        const mem_idx = try self.readU32();
+                        return .{ .memory_init = .{ .data_idx = data_idx, .mem_idx = mem_idx } };
+                    },
+                    9 => {
+                        const data_idx = try self.readU32();
+                        return .{ .data_drop = data_idx };
+                    },
+                    10 => {
+                        const src_mem_idx = try self.readU32();
+                        const dst_mem_idx = try self.readU32();
+                        return .{ .memory_copy = .{ .src_mem_idx = src_mem_idx, .dst_mem_idx = dst_mem_idx } };
+                    },
+                    11 => {
+                        const mem_idx = try self.readU32();
+                        return .{ .memory_fill = mem_idx };
+                    },
+                    else => {
+                        return error.InvalidBulkMemoryInstruction;
+                    },
+                }
+            },
             else => {
                 std.debug.print("Unknown opcode: {x}\n", .{opcode});
                 return error.InvalidInstruction;

@@ -18,4 +18,4 @@ WASM core 1.0 Virtual Machine in Zig
 - [ ] Pass all official tests
 - [ ] WASI preview 1 support
 - [ ] Move to a register VM with SSA passes
-- [ ] AOT compiler
+
