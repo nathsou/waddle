@@ -120,6 +120,7 @@ fn run(allocator: std.mem.Allocator) !void {
         }
 
         const results = try vm.invokeExportedFunc(allocator, func_name, func_args);
+        defer allocator.free(results);
 
         for (results, 0..) |res, i| {
             std.debug.print("{f}", .{res});

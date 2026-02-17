@@ -1289,10 +1289,12 @@ const BytecodeLowering = struct {
 
                 for (label_pcs, 0..) |*pc, i| {
                     const label_idx = arg.label_indices[i];
-                    try self.registerBranchPatch(pc, label_idx, BranchToPatch{ .br_table_patch = .{
-                        .instr_idx = instr_idx,
-                        .label = .{ .index = i },
-                    } });
+                    try self.registerBranchPatch(pc, label_idx, BranchToPatch{
+                        .br_table_patch = .{
+                            .instr_idx = instr_idx,
+                            .label = .{ .index = i },
+                        },
+                    });
                 }
 
                 var br_table_arg = BranchTableArg{
@@ -1300,10 +1302,12 @@ const BytecodeLowering = struct {
                     .default_pc = 0, // To be patched
                 };
 
-                try self.registerBranchPatch(&br_table_arg.default_pc, arg.default_idx, BranchToPatch{ .br_table_patch = .{
-                    .instr_idx = instr_idx,
-                    .label = .default,
-                } });
+                try self.registerBranchPatch(&br_table_arg.default_pc, arg.default_idx, BranchToPatch{
+                    .br_table_patch = .{
+                        .instr_idx = instr_idx,
+                        .label = .default,
+                    },
+                });
 
                 try self.emit(.{ .br_table = .{ .label_pcs = label_pcs, .default_pc = 0 } });
             },
@@ -2389,8 +2393,6 @@ pub const Runtime = struct {
 
                 if (self.bytecode.functions[func_addr]) |entry_pc| {
                     try self.execute(entry_pc);
-
-                    self.stack.top = base_ptr;
                 } else {
                     return error.FunctionNotFound;
                 }
@@ -2398,7 +2400,6 @@ pub const Runtime = struct {
             .host => |host_func| {
                 results_count = host_func.type.results.len;
                 try host_func.code(&self.stack, self.module, &self.store);
-                self.stack.top = args_start;
             },
         }
 
