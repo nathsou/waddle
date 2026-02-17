@@ -1133,10 +1133,11 @@ pub const Parser = struct {
             try init_list.append(self.allocator, idx);
         }
 
+        // TODO: support other element types for the reference types extension
         return .{
-            .table = table_idx,
-            .offset = offset,
-            .init = try init_list.toOwnedSlice(self.allocator),
+            .type = .funcref,
+            .init = .{ .func_indices = try init_list.toOwnedSlice(self.allocator) },
+            .mode = .{ .active = .{ .table_idx = table_idx, .offset = offset } },
         };
     }
 

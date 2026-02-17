@@ -3,12 +3,87 @@ const builtin = @import("builtin");
 const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const Value = types.Value;
 const LocalIndex = types.LocalIndex;
 const GlobalIndex = types.GlobalIndex;
 const MemIndex = types.MemIndex;
+const ValType = types.ValType;
 
 const PC = usize;
+
+const FuncRef = ?FuncAddr;
+const ExternRef = ?*anyopaque;
+
+pub const Value = union(ValType) {
+    const NullRefSentinel = std.math.maxInt(u64);
+
+    i32: i32,
+    i64: i64,
+    f32: f32,
+    f64: f64,
+    funcref: FuncRef,
+    externref: ExternRef,
+
+    pub fn getType(self: Value) ValType {
+        return std.meta.activeTag(self);
+    }
+
+    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .i32 => |n| try writer.print("{d}", .{n}),
+            .i64 => |n| try writer.print("{d}", .{n}),
+            .f32 => |x| try writer.print("{d}", .{x}),
+            .f64 => |x| try writer.print("{d}", .{x}),
+            .funcref => try writer.print("<funcref>", .{}),
+            .externref => try writer.print("<externref>", .{}),
+        }
+    }
+
+    fn static_encode(comptime T: type, val: T) u64 {
+        return switch (T) {
+            i32 => @as(u64, @as(u32, @bitCast(val))),
+            i64 => @as(u64, @bitCast(val)),
+            f32 => @as(u64, @as(u32, @bitCast(val))),
+            f64 => @as(u64, @bitCast(val)),
+            FuncRef => if (val) |func_addr| @intCast(func_addr) else NullRefSentinel,
+            ExternRef => if (val) |ref_ptr| @intCast(@intFromPtr(ref_ptr)) else NullRefSentinel,
+            else => unreachable,
+        };
+    }
+
+    fn static_decode(comptime T: type, val: u64) T {
+        return switch (T) {
+            i32 => @bitCast(@as(u32, @truncate(val))),
+            i64 => @bitCast(val),
+            f32 => @bitCast(@as(u32, @truncate(val))),
+            f64 => @bitCast(val),
+            FuncRef => if (val == NullRefSentinel) null else @intCast(val),
+            ExternRef => if (val == NullRefSentinel) null else @ptrFromInt(val),
+            else => unreachable,
+        };
+    }
+
+    fn encode(self: Value) u64 {
+        return switch (self) {
+            .i32 => |n| static_encode(i32, n),
+            .i64 => |n| static_encode(i64, n),
+            .f32 => |x| static_encode(f32, x),
+            .f64 => |x| static_encode(f64, x),
+            .funcref => |func_ref| static_encode(FuncRef, func_ref),
+            .externref => |ref_ptr| static_encode(ExternRef, ref_ptr),
+        };
+    }
+
+    fn decode(self: ValType, val: u64) Value {
+        return switch (self) {
+            .i32 => .{ .i32 = static_decode(i32, val) },
+            .i64 => .{ .i64 = static_decode(i64, val) },
+            .f32 => .{ .f32 = static_decode(f32, val) },
+            .f64 => .{ .f64 = static_decode(f64, val) },
+            .funcref => .{ .funcref = static_decode(FuncRef, val) },
+            .externref => .{ .externref = static_decode(ExternRef, val) },
+        };
+    }
+};
 
 const MemArg = struct {
     alignment: u32,
@@ -54,6 +129,7 @@ pub const FlatInstr = union(enum) {
     super_i64_const_return: i64,
     super_f32_const_return: f32,
     super_f64_const_return: f64,
+    super_duplicate: usize, // count
 
     // Parametric instructions
     drop,
@@ -239,6 +315,19 @@ pub const FlatInstr = union(enum) {
     i64_trunc_sat_f64_s,
     i64_trunc_sat_f64_u,
 
+    // Reference instructions
+    ref_null: types.RefType,
+    ref_is_null,
+    ref_func: FuncAddr,
+    table_get: TableAddr,
+    table_set: TableAddr,
+    table_init: struct { elem_addr: ElemAddr, table_addr: TableAddr },
+    elem_drop: ElemAddr,
+    table_copy: struct { dst_table_addr: TableAddr, src_table_addr: TableAddr },
+    table_grow: TableAddr,
+    table_size: TableAddr,
+    table_fill: TableAddr,
+
     pub fn format(self: FlatInstr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             // Control instructions
@@ -280,6 +369,9 @@ pub const FlatInstr = union(enum) {
             .super_i64_const_return => |imm| try writer.print("super.i64.const.return {d}", .{imm}),
             .super_f32_const_return => |imm| try writer.print("super.f32.const.return {d}", .{imm}),
             .super_f64_const_return => |imm| try writer.print("super.f64.const.return {d}", .{imm}),
+            .super_duplicate => |count| {
+                try writer.print("super.duplicate {d}", .{count});
+            },
 
             // Parametric instructions
             .drop => try writer.writeAll("drop"),
@@ -479,6 +571,19 @@ pub const FlatInstr = union(enum) {
             .data_drop => |idx| try writer.print("data.drop {d}", .{idx}),
             .memory_copy => |arg| try writer.print("memory.copy dest={d} src={d}", .{ arg.dst_mem, arg.src_mem }),
             .memory_fill => |mem| try writer.print("memory.fill mem={d}", .{mem}),
+
+            // Reference instructions
+            .ref_null => |ref_type| try writer.print("ref.null {f}", .{ref_type}),
+            .ref_is_null => try writer.writeAll("ref.is_null"),
+            .ref_func => |func_addr| try writer.print("ref.func {d}", .{func_addr}),
+            .table_get => |table_addr| try writer.print("table.get {d}", .{table_addr}),
+            .table_set => |table_addr| try writer.print("table.set {d}", .{table_addr}),
+            .table_init => |arg| try writer.print("table.init elem={d} table={d}", .{ arg.elem_addr, arg.table_addr }),
+            .elem_drop => |idx| try writer.print("elem.drop {d}", .{idx}),
+            .table_copy => |arg| try writer.print("table.copy dest={d} src={d}", .{ arg.dst_table_addr, arg.src_table_addr }),
+            .table_grow => |table_addr| try writer.print("table.grow {d}", .{table_addr}),
+            .table_size => |table_addr| try writer.print("table.size {d}", .{table_addr}),
+            .table_fill => |table_addr| try writer.print("table.fill {d}", .{table_addr}),
         }
     }
 };
@@ -1090,14 +1195,19 @@ const BytecodeLowering = struct {
         // Emit instructions to initialize local variables with default values
         // Note: parameters are already on the stack, pushed by caller
         for (func.code.locals) |local_group| {
-            for (0..local_group.count) |_| {
-                // Emit const instruction to push default value
-                switch (local_group.type) {
-                    .i32 => try self.emit(.{ .i32_const = 0 }),
-                    .i64 => try self.emit(.{ .i64_const = 0 }),
-                    .f32 => try self.emit(.{ .f32_const = 0.0 }),
-                    .f64 => try self.emit(.{ .f64_const = 0.0 }),
-                }
+            const default_val: FlatInstr = switch (local_group.type) {
+                .i32 => .{ .i32_const = 0 },
+                .i64 => .{ .i64_const = 0 },
+                .f32 => .{ .f32_const = 0.0 },
+                .f64 => .{ .f64_const = 0.0 },
+                .funcref => .{ .ref_null = .funcref },
+                .externref => .{ .ref_null = .externref },
+            };
+
+            try self.emit(default_val);
+
+            if (local_group.count > 1) {
+                try self.emit(.{ .super_duplicate = local_group.count - 1 });
             }
         }
 
@@ -1177,6 +1287,14 @@ const BytecodeLowering = struct {
 
                 pc.* = 0; // Placeholder
             },
+        }
+    }
+
+    fn getCurrentModule(self: *BytecodeLowering) !*ModuleInstance {
+        if (self.current_func) |func| {
+            return func.module;
+        } else {
+            return error.NoCurrentFunction;
         }
     }
 
@@ -1313,23 +1431,23 @@ const BytecodeLowering = struct {
             },
             .call => |func_idx| {
                 const call_instr_idx = self.flat.items.len;
-                const func_inst = self.store.funcs.items[func_idx];
+                const module_inst = try self.getCurrentModule();
+                const func_addr = module_inst.func_addrs[func_idx];
+                const func_inst = self.store.funcs.items[func_addr];
 
                 switch (func_inst) {
                     .wasm => |wasm_func| {
                         try self.emit(.{ .call = .{ .entry_pc = 0, .arguments = wasm_func.type.params.len } });
-                        std.debug.assert(func_idx < self.func_labels.len);
-                        try self.func_labels[func_idx].calls_to_patch.append(self.allocator, call_instr_idx);
+                        std.debug.assert(func_addr < self.func_labels.len);
+                        try self.func_labels[func_addr].calls_to_patch.append(self.allocator, call_instr_idx);
                     },
                     .host => {
-                        try self.emit(.{ .call_host = func_idx });
+                        try self.emit(.{ .call_host = func_addr });
                     },
                 }
             },
             .call_indirect => |arg| {
-                std.debug.assert(self.current_func != null);
-                std.debug.assert(self.current_func.?.module.table_addrs.len > arg.table_idx);
-                const module_inst = self.current_func.?.module;
+                const module_inst = try self.getCurrentModule();
                 const table_addr = module_inst.table_addrs[arg.table_idx];
                 std.debug.assert(module_inst.types.len > arg.type_idx);
                 const func_type = &module_inst.types[arg.type_idx];
@@ -1545,6 +1663,60 @@ const BytecodeLowering = struct {
             .i64_trunc_sat_f32_u => try self.emit(.i64_trunc_sat_f32_u),
             .i64_trunc_sat_f64_s => try self.emit(.i64_trunc_sat_f64_s),
             .i64_trunc_sat_f64_u => try self.emit(.i64_trunc_sat_f64_u),
+            .ref_null => |rt| try self.emit(.{ .ref_null = rt }),
+            .ref_is_null => try self.emit(.ref_is_null),
+            .ref_func => |func_idx| {
+                const module_inst = try self.getCurrentModule();
+                const func_addr = module_inst.func_addrs[func_idx];
+                try self.emit(.{ .ref_func = func_addr });
+            },
+            .table_get => |idx| {
+                const module_inst = try self.getCurrentModule();
+                const table_addr = module_inst.table_addrs[idx];
+                try self.emit(.{ .table_get = table_addr });
+            },
+            .table_set => |idx| {
+                const module_inst = try self.getCurrentModule();
+                const table_addr = module_inst.table_addrs[idx];
+                try self.emit(.{ .table_set = table_addr });
+            },
+            .table_init => |arg| {
+                const module_inst = try self.getCurrentModule();
+                const table_addr = module_inst.table_addrs[arg.table_idx];
+                const elem_addr = module_inst.elem_addrs[arg.elem_idx];
+                try self.emit(.{ .table_init = .{ .elem_addr = elem_addr, .table_addr = table_addr } });
+            },
+            .elem_drop => |elem_idx| {
+                const module_inst = try self.getCurrentModule();
+                const elem_addr = module_inst.elem_addrs[elem_idx];
+                try self.emit(.{ .elem_drop = elem_addr });
+            },
+            .table_copy => |arg| {
+                const module_inst = try self.getCurrentModule();
+                const src_table_addr = module_inst.table_addrs[arg.src_table_idx];
+                const dst_table_addr = module_inst.table_addrs[arg.dst_table_idx];
+                try self.emit(.{
+                    .table_copy = .{
+                        .src_table_addr = src_table_addr,
+                        .dst_table_addr = dst_table_addr,
+                    },
+                });
+            },
+            .table_grow => |idx| {
+                const module_inst = try self.getCurrentModule();
+                const table_addr = module_inst.table_addrs[idx];
+                try self.emit(.{ .table_grow = table_addr });
+            },
+            .table_size => |idx| {
+                const module_inst = try self.getCurrentModule();
+                const table_addr = module_inst.table_addrs[idx];
+                try self.emit(.{ .table_size = table_addr });
+            },
+            .table_fill => |idx| {
+                const module_inst = try self.getCurrentModule();
+                const table_addr = module_inst.table_addrs[idx];
+                try self.emit(.{ .table_fill = table_addr });
+            },
         }
     }
 };
@@ -1555,6 +1727,7 @@ pub const Store = struct {
     funcs: ArrayList(FuncInstance),
     tables: ArrayList(TableInstance),
     mems: ArrayList(MemoryInstance),
+    elems: ArrayList(ElemInstance),
     datas: ArrayList(DataInstance),
     globals: ArrayList(GlobalInstance),
 
@@ -1565,6 +1738,7 @@ pub const Store = struct {
             .funcs = .empty,
             .tables = .empty,
             .mems = .empty,
+            .elems = .empty,
             .datas = .empty,
             .globals = .empty,
         };
@@ -1582,6 +1756,7 @@ pub const Store = struct {
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.mems.deinit(self.allocator);
+        self.elems.deinit(self.allocator);
         self.datas.deinit(self.allocator);
         self.globals.deinit(self.allocator);
     }
@@ -1625,6 +1800,8 @@ pub const Store = struct {
         errdefer allocator.free(data_addrs);
         const global_addrs = try allocator.alloc(GlobalAddr, num_global_extern_vals + module.globals.len);
         errdefer allocator.free(global_addrs);
+        const elem_addrs = try allocator.alloc(ElemAddr, module.elements.len);
+        errdefer allocator.free(elem_addrs);
         const exports = try allocator.alloc(ExportInstance, module.exports.len);
         errdefer allocator.free(exports);
 
@@ -1638,6 +1815,7 @@ pub const Store = struct {
             .mem_addrs = mem_addrs,
             .data_addrs = data_addrs,
             .global_addrs = global_addrs,
+            .elem_addrs = elem_addrs,
             .exports = exports,
             .exports_by_name = .init(allocator),
         };
@@ -1648,6 +1826,7 @@ pub const Store = struct {
         const table_base = self.tables.items.len;
         const mem_base = self.mems.items.len;
         const global_base = self.globals.items.len;
+        const elem_base = self.elems.items.len;
 
         var next_func_idx: usize = 0;
         var next_table_idx: usize = 0;
@@ -1722,9 +1901,10 @@ pub const Store = struct {
         // Allocate tables
         var local_table_idx: usize = 0;
         for (module.tables) |table_type| {
-            const elem = try self.allocator.alloc(?FuncAddr, table_type.limits.min);
-            @memset(elem, null);
+            const elem = try self.allocator.alloc(u64, table_type.limits.min);
+            @memset(elem, Value.NullRefSentinel);
             const table_inst = TableInstance{
+                .type = table_type.elem_type,
                 .elem = elem,
                 .max = table_type.limits.max,
             };
@@ -1754,18 +1934,52 @@ pub const Store = struct {
         }
 
         // Allocate globals
-        var local_global_idx: usize = 0;
         for (module.globals, 0..) |global, i| {
             const global_inst = GlobalInstance{
                 .value = global_init_vals[i],
                 .mutable = global.type.mutable,
             };
 
-            const global_addr = global_base + local_global_idx;
+            const global_addr = global_base + i;
             module_inst.global_addrs[next_global_idx] = global_addr;
             next_global_idx += 1;
-            local_global_idx += 1;
             try self.globals.append(self.allocator, global_inst);
+        }
+
+        // Allocate elements
+        for (module.elements, 0..) |*elem, i| {
+            var elem_inst = ElemInstance{
+                .refs = try self.allocator.alloc(u64, elem.init.length()),
+            };
+
+            switch (elem.init) {
+                .func_indices => |indices| {
+                    for (indices, 0..) |func_idx, j| {
+                        const func_idx_usize = @as(usize, func_idx);
+                        if (func_idx_usize >= module_inst.func_addrs.len) {
+                            return error.InvalidFuncIndex;
+                        }
+
+                        const func_addr = module_inst.func_addrs[func_idx_usize];
+                        elem_inst.refs[j] = Value.static_encode(FuncRef, func_addr);
+                    }
+                },
+                .exprs => |exprs| {
+                    for (exprs, 0..) |expr, j| {
+                        const val = try self.evalConstExpr(global_addrs, expr);
+
+                        if (!val.getType().isRefType()) {
+                            return error.InvalidElemInitExpr;
+                        }
+
+                        elem_inst.refs[j] = val.encode();
+                    }
+                },
+            }
+
+            const elem_addr = elem_base + i;
+            module_inst.elem_addrs[i] = elem_addr;
+            try self.elems.append(self.allocator, elem_inst);
         }
 
         // Build exports
@@ -1879,6 +2093,26 @@ pub const Store = struct {
         return error.ImportNotFound;
     }
 
+    fn initTable(
+        self: *Store,
+        table_addr: TableAddr,
+        elem_addr: ElemAddr,
+        table_src_offset: usize,
+        elem_dst_offset: usize,
+        count: usize,
+    ) !void {
+        const table_inst = &self.tables.items[table_addr];
+        const values = self.elems.items[elem_addr].refs;
+        if (table_src_offset + count > table_inst.elem.len or elem_dst_offset + count > table_inst.elem.len or table_src_offset + count > values.len) {
+            return error.TableInitOutOfBounds;
+        }
+
+        @memcpy(
+            table_inst.elem[table_src_offset .. table_src_offset + count],
+            values[elem_dst_offset .. elem_dst_offset + count],
+        );
+    }
+
     pub fn instantiate(self: *Store, module: types.Module, imports: []const Import) !*ModuleInstance {
         // TODO: Validate the module
 
@@ -1933,41 +2167,42 @@ pub const Store = struct {
             global_init_vals[i] = val;
         }
 
+        const elems_base_idx = self.elems.items.len;
         const module_inst = try self.allocModule(self.allocator, module, extern_vals.items, global_init_vals);
 
         // Initalise element segments
-        for (module.elements) |elem| {
-            const offset_val = try self.evalConstExpr(global_extern_vals, elem.offset);
-            const offset = switch (offset_val) {
-                .i32 => |n| blk: {
-                    if (n < 0) {
-                        return error.InvalidElemSegmentOffset;
+        for (module.elements, 0..) |elem, i| {
+            switch (elem.mode) {
+                .passive, .declarative => {},
+                .active => |mode| {
+                    const offset_val = try self.evalConstExpr(global_extern_vals, mode.offset);
+                    const offset = switch (offset_val) {
+                        .i32 => |n| blk: {
+                            if (n < 0) {
+                                return error.InvalidElemSegmentOffset;
+                            }
+
+                            break :blk @as(usize, @as(u32, @bitCast(n)));
+                        },
+                        else => return error.InvalidElemSegmentOffset,
+                    };
+
+                    const table_idx_usize = @as(usize, mode.table_idx);
+                    if (table_idx_usize >= module_inst.table_addrs.len) {
+                        return error.InvalidTableIndex;
                     }
 
-                    break :blk @as(usize, @as(u32, @bitCast(n)));
+                    const table_addr = module_inst.table_addrs[table_idx_usize];
+                    const elem_addr = elems_base_idx + i;
+
+                    try self.initTable(
+                        table_addr,
+                        elem_addr,
+                        offset,
+                        0,
+                        elem.init.length(),
+                    );
                 },
-                else => return error.InvalidElemSegmentOffset,
-            };
-
-            const table_idx_usize = @as(usize, elem.table);
-            if (table_idx_usize >= module_inst.table_addrs.len) {
-                return error.InvalidTableIndex;
-            }
-
-            const table_addr = module_inst.table_addrs[table_idx_usize];
-            const table_inst = self.tables.items[table_addr];
-            if (offset + elem.init.len > table_inst.elem.len) {
-                return error.ElementSegmentOutOfBounds;
-            }
-
-            for (elem.init, 0..) |func_idx, i| {
-                const func_idx_usize = @as(usize, func_idx);
-                if (func_idx_usize >= module_inst.func_addrs.len) {
-                    return error.InvalidFuncIndex;
-                }
-
-                const func_addr = module_inst.func_addrs[func_idx_usize];
-                table_inst.elem[offset + i] = func_addr;
             }
         }
 
@@ -2014,6 +2249,7 @@ pub const TableAddr = Addr;
 pub const MemAddr = Addr;
 pub const DataAddr = Addr;
 pub const GlobalAddr = Addr;
+pub const ElemAddr = Addr;
 
 pub const ModuleInstance = struct {
     types: []types.FuncType,
@@ -2022,6 +2258,7 @@ pub const ModuleInstance = struct {
     mem_addrs: []MemAddr,
     data_addrs: []DataAddr,
     global_addrs: []GlobalAddr,
+    elem_addrs: []ElemAddr,
     exports: []ExportInstance,
     exports_by_name: std.StringHashMap(ExternVal),
 
@@ -2031,6 +2268,7 @@ pub const ModuleInstance = struct {
         allocator.free(self.mem_addrs);
         allocator.free(self.data_addrs);
         allocator.free(self.global_addrs);
+        allocator.free(self.elem_addrs);
         allocator.free(self.exports);
         self.exports_by_name.deinit();
     }
@@ -2064,8 +2302,38 @@ const FuncInstance = union(enum) {
 const FuncElem = ?FuncAddr;
 
 const TableInstance = struct {
-    elem: []FuncElem,
+    type: types.RefType,
+    elem: []u64, // encoded FuncRef or ExternRef
     max: ?u32,
+
+    fn getElem(self: *const TableInstance, idx: usize) !Value {
+        if (idx >= self.elem.len) {
+            return error.TableIndexOutOfBounds;
+        }
+
+        const encoded_ref = self.elem[idx];
+        return switch (self.type) {
+            .funcref => .{ .funcref = Value.static_decode(FuncRef, encoded_ref) },
+            .externref => .{ .externref = Value.static_decode(ExternRef, encoded_ref) },
+        };
+    }
+
+    fn setElem(self: *TableInstance, idx: usize, val: Value) !void {
+        if (idx >= self.elem.len) {
+            return error.TableIndexOutOfBounds;
+        }
+
+        if (@intFromEnum(val.getType()) != @intFromEnum(self.type)) {
+            return error.InvalidTableElementType;
+        }
+
+        const encoded_ref: u64 = switch (self.type) {
+            .funcref => Value.static_encode(FuncRef, val.funcref),
+            .externref => Value.static_encode(ExternRef, val.externref),
+        };
+
+        self.elem[idx] = encoded_ref;
+    }
 };
 
 const page_size: usize = 65_536;
@@ -2087,6 +2355,10 @@ const DataInstance = struct {
 const ExportInstance = struct {
     name: types.Name,
     value: ExternVal,
+};
+
+const ElemInstance = struct {
+    refs: []u64, // encoded FuncRef or ExternRef
 };
 
 pub const ExternVal = union(enum) {
@@ -2138,7 +2410,7 @@ pub const ValueStack = struct {
     const Size = 16384;
     const Self = @This();
     values: [Size]u64,
-    types: [Size]types.ValType,
+    types: [Size]ValType,
     top: usize,
 
     fn init() Self {
@@ -2149,32 +2421,14 @@ pub const ValueStack = struct {
         };
     }
 
-    fn matchingValType(comptime T: type) types.ValType {
+    fn matchingValType(comptime T: type) ValType {
         return switch (T) {
-            i32 => types.ValType.i32,
-            i64 => types.ValType.i64,
-            f32 => types.ValType.f32,
-            f64 => types.ValType.f64,
-            else => unreachable,
-        };
-    }
-
-    fn encode(comptime T: type, val: T) u64 {
-        return switch (T) {
-            i32 => @as(u64, @as(u32, @bitCast(val))),
-            i64 => @as(u64, @bitCast(val)),
-            f32 => @as(u64, @as(u32, @bitCast(val))),
-            f64 => @as(u64, @bitCast(val)),
-            else => unreachable,
-        };
-    }
-
-    fn decode(comptime T: type, val: u64) T {
-        return switch (T) {
-            i32 => @bitCast(@as(u32, @truncate(val))),
-            i64 => @bitCast(val),
-            f32 => @bitCast(@as(u32, @truncate(val))),
-            f64 => @bitCast(val),
+            i32 => .i32,
+            i64 => .i64,
+            f32 => .f32,
+            f64 => .f64,
+            FuncRef => .funcref,
+            ExternRef => .externref,
             else => unreachable,
         };
     }
@@ -2184,7 +2438,7 @@ pub const ValueStack = struct {
             return error.StackOverflow;
         }
 
-        self.values[self.top] = encode(T, val);
+        self.values[self.top] = Value.static_encode(T, val);
         self.types[self.top] = matchingValType(T);
         self.top += 1;
     }
@@ -2208,7 +2462,7 @@ pub const ValueStack = struct {
 
         std.debug.assert(self.types[self.top] == matchingValType(T));
 
-        return decode(T, self.values[self.top]);
+        return Value.static_decode(T, self.values[self.top]);
     }
 
     pub fn popValue(self: *Self) !Value {
@@ -2222,10 +2476,12 @@ pub const ValueStack = struct {
         const val = self.values[self.top];
 
         return switch (val_type) {
-            .i32 => .{ .i32 = decode(i32, val) },
-            .i64 => .{ .i64 = decode(i64, val) },
-            .f32 => .{ .f32 = decode(f32, val) },
-            .f64 => .{ .f64 = decode(f64, val) },
+            .i32 => .{ .i32 = Value.static_decode(i32, val) },
+            .i64 => .{ .i64 = Value.static_decode(i64, val) },
+            .f32 => .{ .f32 = Value.static_decode(f32, val) },
+            .f64 => .{ .f64 = Value.static_decode(f64, val) },
+            .funcref => .{ .funcref = Value.static_decode(FuncRef, val) },
+            .externref => .{ .externref = Value.static_decode(ExternRef, val) },
         };
     }
 
@@ -2237,7 +2493,7 @@ pub const ValueStack = struct {
         self.top -= count;
 
         const vals = try allocator.alloc(Value, count);
-        errdefer self.allocator.free(vals);
+        errdefer allocator.free(vals);
 
         for (vals, 0..) |*val, i| {
             val.* = self.getValue(self.top + i);
@@ -2249,30 +2505,40 @@ pub const ValueStack = struct {
     fn getValue(self: *const Self, idx: usize) Value {
         const val = self.values[idx];
         return switch (self.types[idx]) {
-            .i32 => .{ .i32 = decode(i32, val) },
-            .i64 => .{ .i64 = decode(i64, val) },
-            .f32 => .{ .f32 = decode(f32, val) },
-            .f64 => .{ .f64 = decode(f64, val) },
+            .i32 => .{ .i32 = Value.static_decode(i32, val) },
+            .i64 => .{ .i64 = Value.static_decode(i64, val) },
+            .f32 => .{ .f32 = Value.static_decode(f32, val) },
+            .f64 => .{ .f64 = Value.static_decode(f64, val) },
+            .funcref => .{ .funcref = Value.static_decode(FuncRef, val) },
+            .externref => .{ .externref = Value.static_decode(ExternRef, val) },
         };
     }
 
     fn setValue(self: *Self, idx: usize, val: Value) void {
         switch (val) {
             .i32 => |v| {
-                self.values[idx] = encode(i32, v);
+                self.values[idx] = Value.static_encode(i32, v);
                 self.types[idx] = types.ValType.i32;
             },
             .i64 => |v| {
-                self.values[idx] = encode(i64, v);
+                self.values[idx] = Value.static_encode(i64, v);
                 self.types[idx] = types.ValType.i64;
             },
             .f32 => |v| {
-                self.values[idx] = encode(f32, v);
+                self.values[idx] = Value.static_encode(f32, v);
                 self.types[idx] = types.ValType.f32;
             },
             .f64 => |v| {
-                self.values[idx] = encode(f64, v);
+                self.values[idx] = Value.static_encode(f64, v);
                 self.types[idx] = types.ValType.f64;
+            },
+            .funcref => |v| {
+                self.values[idx] = Value.static_encode(FuncRef, v);
+                self.types[idx] = types.ValType.funcref;
+            },
+            .externref => |v| {
+                self.values[idx] = Value.static_encode(ExternRef, v);
+                self.types[idx] = types.ValType.externref;
             },
         }
     }
@@ -2426,11 +2692,15 @@ pub const Runtime = struct {
         return self.stack.popValue() catch unreachable;
     }
 
-    fn pop2Values(self: *Runtime, comptime T: type) [2]T {
-        const rhs = ValueStack.decode(T, self.stack.values[self.stack.top - 1]);
-        const lhs = ValueStack.decode(T, self.stack.values[self.stack.top - 2]);
-        self.stack.top -= 2;
-        return .{ lhs, rhs };
+    fn popValues(self: *Runtime, comptime T: type, comptime N: comptime_int) [N]T {
+        var vals: [N]T = undefined;
+
+        inline for (0..N) |i| {
+            vals[i] = Value.static_decode(T, self.stack.values[self.stack.top - N + i]);
+        }
+
+        self.stack.top -= N;
+        return vals;
     }
 
     fn peek(self: *Runtime) !Value {
@@ -2666,7 +2936,7 @@ pub const Runtime = struct {
                         return error.InvalidIndirectCallIndex;
                     }
 
-                    if (table_inst.elem[i]) |func_addr| {
+                    if (Value.static_decode(FuncRef, table_inst.elem[i])) |func_addr| {
                         const func_inst = self.store.funcs.items[func_addr];
 
                         if (!func_inst.getType().eql(call.func_type.*)) {
@@ -2694,7 +2964,7 @@ pub const Runtime = struct {
                     }
                 },
                 .super_i32_eq_br_if => |target_pc| {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     if (args[0] == args[1]) {
                         pc = target_pc;
                     }
@@ -2771,6 +3041,18 @@ pub const Runtime = struct {
                 .super_f64_const_return => |imm| {
                     if (try self.superConstReturn(f64, imm, &pc)) return;
                 },
+                .super_duplicate => |count| {
+                    const last_val_idx = self.stack.top - 1;
+                    const val_ty = self.stack.types[last_val_idx];
+                    const val = self.stack.values[last_val_idx];
+
+                    for (self.stack.top..self.stack.top + count) |i| {
+                        self.stack.values[i] = val;
+                        self.stack.types[i] = val_ty;
+                    }
+
+                    self.stack.top += count;
+                },
                 .drop => {
                     self.stack.top -= 1;
                 },
@@ -2835,49 +3117,49 @@ pub const Runtime = struct {
                     try self.pushBool(val == 0);
                 },
                 .i32_eq => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.pushBool(args[0] == args[1]);
                 },
                 .i32_ne => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.pushBool(args[0] != args[1]);
                 },
                 .i32_lt_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.pushBool(args[0] < args[1]);
                 },
                 .i32_lt_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs < rhs);
                 },
                 .i32_gt_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.pushBool(args[0] > args[1]);
                 },
                 .i32_gt_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs > rhs);
                 },
                 .i32_le_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.pushBool(args[0] <= args[1]);
                 },
                 .i32_le_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs <= rhs);
                 },
                 .i32_ge_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.pushBool(args[0] >= args[1]);
                 },
                 .i32_ge_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.pushBool(lhs >= rhs);
@@ -2895,69 +3177,69 @@ pub const Runtime = struct {
                     try self.push(i32, @popCount(val));
                 },
                 .i32_add => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, args[0] +% args[1]);
                 },
                 .i32_sub => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, args[0] -% args[1]);
                 },
                 .i32_mul => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, args[0] *% args[1]);
                 },
                 .i32_div_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, try intDiv(i32, args[0], args[1]));
                 },
                 .i32_div_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.push(i32, @bitCast(try intDiv(u32, lhs, rhs)));
                 },
                 .i32_rem_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, try intRem(i32, args[0], args[1]));
                 },
                 .i32_rem_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const lhs: u32 = @bitCast(args[0]);
                     const rhs: u32 = @bitCast(args[1]);
                     try self.push(i32, @bitCast(try intRem(u32, lhs, rhs)));
                 },
                 .i32_and => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, args[0] & args[1]);
                 },
                 .i32_or => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, args[0] | args[1]);
                 },
                 .i32_xor => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, args[0] ^ args[1]);
                 },
                 .i32_shl => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, intShl(i32, args[0], args[1]));
                 },
                 .i32_shr_s => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, intShr(i32, args[0], args[1]));
                 },
                 .i32_shr_u => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     try self.push(i32, @bitCast(intShr(u32, @as(u32, @bitCast(args[0])), @as(u32, @bitCast(args[1])))));
                 },
                 .i32_rotl => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const val: u32 = @bitCast(args[0]);
                     const shift = @as(u32, @bitCast(args[1])) & 31;
                     try self.push(i32, @bitCast(std.math.rotl(u32, val, shift)));
                 },
                 .i32_rotr => {
-                    const args = self.pop2Values(i32);
+                    const args = self.popValues(i32, 2);
                     const val: u32 = @bitCast(args[0]);
                     const shift = @as(u32, @bitCast(args[1])) & 31;
                     try self.push(i32, @bitCast(std.math.rotr(u32, val, shift)));
@@ -3111,99 +3393,99 @@ pub const Runtime = struct {
                     try self.pushBool(val == 0);
                 },
                 .i64_eq => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.pushBool(args[0] == args[1]);
                 },
                 .i64_ne => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.pushBool(args[0] != args[1]);
                 },
                 .i64_lt_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.pushBool(args[0] < args[1]);
                 },
                 .i64_lt_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs < rhs);
                 },
                 .i64_gt_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.pushBool(args[0] > args[1]);
                 },
                 .i64_gt_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs > rhs);
                 },
                 .i64_le_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.pushBool(args[0] <= args[1]);
                 },
                 .i64_le_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs <= rhs);
                 },
                 .i64_ge_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.pushBool(args[0] >= args[1]);
                 },
                 .i64_ge_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.pushBool(lhs >= rhs);
                 },
                 .f32_eq => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.pushBool(args[0] == args[1]);
                 },
                 .f32_ne => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.pushBool(args[0] != args[1]);
                 },
                 .f32_lt => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.pushBool(args[0] < args[1]);
                 },
                 .f32_gt => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.pushBool(args[0] > args[1]);
                 },
                 .f32_le => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.pushBool(args[0] <= args[1]);
                 },
                 .f32_ge => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.pushBool(args[0] >= args[1]);
                 },
                 .f64_eq => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.pushBool(args[0] == args[1]);
                 },
                 .f64_ne => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.pushBool(args[0] != args[1]);
                 },
                 .f64_lt => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.pushBool(args[0] < args[1]);
                 },
                 .f64_gt => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.pushBool(args[0] > args[1]);
                 },
                 .f64_le => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.pushBool(args[0] <= args[1]);
                 },
                 .f64_ge => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.pushBool(args[0] >= args[1]);
                 },
                 .i64_clz => {
@@ -3219,69 +3501,69 @@ pub const Runtime = struct {
                     try self.push(i64, @popCount(val));
                 },
                 .i64_add => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, args[0] +% args[1]);
                 },
                 .i64_sub => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, args[0] -% args[1]);
                 },
                 .i64_mul => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, args[0] *% args[1]);
                 },
                 .i64_div_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, try intDiv(i64, args[0], args[1]));
                 },
                 .i64_div_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.push(i64, @bitCast(try intDiv(u64, lhs, rhs)));
                 },
                 .i64_rem_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, try intRem(i64, args[0], args[1]));
                 },
                 .i64_rem_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const lhs: u64 = @bitCast(args[0]);
                     const rhs: u64 = @bitCast(args[1]);
                     try self.push(i64, @bitCast(try intRem(u64, lhs, rhs)));
                 },
                 .i64_and => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, args[0] & args[1]);
                 },
                 .i64_or => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, args[0] | args[1]);
                 },
                 .i64_xor => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, args[0] ^ args[1]);
                 },
                 .i64_shl => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, intShl(i64, args[0], args[1]));
                 },
                 .i64_shr_s => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, intShr(i64, args[0], args[1]));
                 },
                 .i64_shr_u => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     try self.push(i64, @bitCast(intShr(u64, @as(u64, @bitCast(args[0])), @as(u64, @bitCast(args[1])))));
                 },
                 .i64_rotl => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const val: u64 = @bitCast(args[0]);
                     const shift = @as(u64, @bitCast(args[1])) & 63;
                     try self.push(i64, @bitCast(std.math.rotl(u64, val, shift)));
                 },
                 .i64_rotr => {
-                    const args = self.pop2Values(i64);
+                    const args = self.popValues(i64, 2);
                     const val: u64 = @bitCast(args[0]);
                     const shift = @as(u64, @bitCast(args[1])) & 63;
                     try self.push(i64, @bitCast(std.math.rotr(u64, val, shift)));
@@ -3315,31 +3597,31 @@ pub const Runtime = struct {
                     try self.push(f32, @sqrt(val));
                 },
                 .f32_add => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, args[0] + args[1]);
                 },
                 .f32_sub => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, args[0] - args[1]);
                 },
                 .f32_mul => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, args[0] * args[1]);
                 },
                 .f32_div => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, args[0] / args[1]);
                 },
                 .f32_min => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, @min(args[0], args[1]));
                 },
                 .f32_max => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, @max(args[0], args[1]));
                 },
                 .f32_copysign => {
-                    const args = self.pop2Values(f32);
+                    const args = self.popValues(f32, 2);
                     try self.push(f32, floatCopysign(f32, args[0], args[1]));
                 },
                 .f64_abs => {
@@ -3371,31 +3653,31 @@ pub const Runtime = struct {
                     try self.push(f64, @sqrt(val));
                 },
                 .f64_add => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, args[0] + args[1]);
                 },
                 .f64_sub => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, args[0] - args[1]);
                 },
                 .f64_mul => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, args[0] * args[1]);
                 },
                 .f64_div => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, args[0] / args[1]);
                 },
                 .f64_min => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, @min(args[0], args[1]));
                 },
                 .f64_max => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, @max(args[0], args[1]));
                 },
                 .f64_copysign => {
-                    const args = self.pop2Values(f64);
+                    const args = self.popValues(f64, 2);
                     try self.push(f64, floatCopysign(f64, args[0], args[1]));
                 },
                 .i32_trunc_f32_s => {
@@ -3522,6 +3804,80 @@ pub const Runtime = struct {
                 },
                 .i64_trunc_sat_f64_u => {
                     try self.push(i64, @bitCast(truncSat(u64, f64, self.pop(f64))));
+                },
+                .ref_null => |ref_type| {
+                    switch (ref_type) {
+                        .funcref => {
+                            try self.push(FuncRef, null);
+                        },
+                        .externref => {
+                            try self.push(ExternRef, null);
+                        },
+                    }
+                },
+                .ref_is_null => {
+                    const val = self.popValue();
+                    const is_null: bool = switch (val) {
+                        .funcref => |r| r == null,
+                        .externref => |r| r == null,
+                        else => false,
+                    };
+
+                    try self.pushBool(is_null);
+                },
+                .ref_func => |func_idx| {
+                    try self.push(FuncRef, func_idx);
+                },
+                .table_get => |table_idx| {
+                    const table_inst = &self.store.tables.items[table_idx];
+                    const elem_idx: usize = @intCast(self.pop(i32));
+
+                    if (elem_idx >= table_inst.elem.len) {
+                        return error.TableGetOutOfBounds;
+                    }
+
+                    const ref = try table_inst.getElem(elem_idx);
+                    try self.pushValue(ref);
+                },
+                .table_set => |table_idx| {
+                    const table_inst = &self.store.tables.items[table_idx];
+                    const ref = self.popValue();
+                    const elem_idx: usize = @intCast(self.pop(i32));
+
+                    if (elem_idx >= table_inst.elem.len) {
+                        return error.TableSetOutOfBounds;
+                    }
+
+                    try table_inst.setElem(elem_idx, ref);
+                },
+                .table_init => |arg| {
+                    const args = self.popValues(i32, 3);
+                    const count: usize = @intCast(args[0]);
+                    const table_src_offset: usize = @intCast(args[1]);
+                    const elem_dst_offset: usize = @intCast(args[2]);
+
+                    try self.store.initTable(
+                        arg.table_addr,
+                        arg.elem_addr,
+                        table_src_offset,
+                        elem_dst_offset,
+                        count,
+                    );
+                },
+                .elem_drop => {
+                    return error.ElemDropNotImplemented;
+                },
+                .table_copy => {
+                    return error.TableCopyNotImplemented;
+                },
+                .table_grow => {
+                    return error.TableGrowNotImplemented;
+                },
+                .table_size => {
+                    return error.TableSizeNotImplemented;
+                },
+                .table_fill => {
+                    return error.TableFillNotImplemented;
                 },
             }
         }

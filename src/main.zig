@@ -5,6 +5,7 @@ const parse = waddle.parse;
 const wat = waddle.wat;
 const runtime = waddle.runtime;
 const types = waddle.types;
+const Value = runtime.Value;
 
 const source =
     \\int fib(int arg0);
@@ -113,7 +114,7 @@ fn run(allocator: std.mem.Allocator) !void {
             return;
         }
 
-        const func_args = try allocator.alloc(types.Value, func_type.params.len);
+        const func_args = try allocator.alloc(Value, func_type.params.len);
         defer allocator.free(func_args);
         for (func_type.params, 0..) |param_type, i| {
             func_args[i] = try parseValue(func_arg_strings[i], param_type);
@@ -136,12 +137,14 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn parseValue(raw: []const u8, val_type: types.ValType) !types.Value {
+fn parseValue(raw: []const u8, val_type: types.ValType) !Value {
     return switch (val_type) {
         .i32 => .{ .i32 = try std.fmt.parseInt(i32, raw, 0) },
         .i64 => .{ .i64 = try std.fmt.parseInt(i64, raw, 0) },
         .f32 => .{ .f32 = try std.fmt.parseFloat(f32, raw) },
         .f64 => .{ .f64 = try std.fmt.parseFloat(f64, raw) },
+        .funcref => return error.UnsupportedFuncRefArgs,
+        .externref => return error.UnsupportedExternRefArgs,
     };
 }
 

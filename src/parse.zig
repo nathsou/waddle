@@ -137,8 +137,19 @@ pub const Parser = struct {
             0x7E => .i64,
             0x7D => .f32,
             0x7C => .f64,
-            0x70, 0x6F => return error.ReferenceTypesNotSupported,
+            0x70 => .funcref,
+            0x6F => .externref,
             else => return error.InvalidValType,
+        };
+    }
+
+    fn readRefType(self: *Parser) !types.RefType {
+        const n = try self.readByte();
+
+        return switch (n) {
+            0x70 => .funcref,
+            0x6F => .externref,
+            else => return error.InvalidRefType,
         };
     }
 
@@ -207,14 +218,8 @@ pub const Parser = struct {
     }
 
     fn readTableType(self: *Parser) !types.TableType {
-        const elem_type_n = try self.readByte();
-        const elem_type = switch (elem_type_n) {
-            0x70 => .funcref,
-            else => return error.InvalidElemType,
-        };
-
+        const elem_type = try self.readRefType();
         const limits = try self.readLimits();
-
         return .{ .elem_type = elem_type, .limits = limits };
     }
 
@@ -272,16 +277,97 @@ pub const Parser = struct {
         };
     }
 
-    fn readElem(self: *Parser) !types.Elem {
-        const table_idx = try self.readU32();
-        const offset_expr = try self.readExpr();
-        const func_indices = try self.readVector(types.FuncIndex, readU32);
+    fn readElemKind(self: *Parser) !types.RefType {
+        const elem_kind = try self.readU32();
 
-        return .{
-            .table = table_idx,
-            .offset = offset_expr,
-            .init = func_indices,
+        return switch (elem_kind) {
+            0x00 => .funcref,
+            else => return error.InvalidElemKind,
         };
+    }
+
+    fn readElem(self: *Parser) !types.Elem {
+        const flags = try self.readU32();
+
+        switch (flags) {
+            0 => {
+                const offset = try self.readExpr();
+                const func_indices: []types.FuncIndex = try self.readVector(types.FuncIndex, readU32);
+                return .{
+                    .type = .funcref,
+                    .init = .{ .func_indices = func_indices },
+                    .mode = .{ .active = .{ .table_idx = 0, .offset = offset } },
+                };
+            },
+            1 => {
+                const ty = try self.readElemKind();
+                const func_indices: []types.FuncIndex = try self.readVector(types.FuncIndex, readU32);
+                return .{
+                    .type = ty,
+                    .init = .{ .func_indices = func_indices },
+                    .mode = .passive,
+                };
+            },
+            2 => {
+                const table_idx = try self.readU32();
+                const offset = try self.readExpr();
+                const ty = try self.readElemKind();
+                const func_indices: []types.FuncIndex = try self.readVector(types.FuncIndex, readU32);
+                return .{
+                    .type = ty,
+                    .init = .{ .func_indices = func_indices },
+                    .mode = .{ .active = .{ .table_idx = table_idx, .offset = offset } },
+                };
+            },
+            3 => {
+                const ty = try self.readElemKind();
+                const init_func_indices: []types.FuncIndex = try self.readVector(types.FuncIndex, readU32);
+                return .{
+                    .type = ty,
+                    .init = .{ .func_indices = init_func_indices },
+                    .mode = .declarative,
+                };
+            },
+            4 => {
+                const offset = try self.readExpr();
+                const init_exprs: []types.Expr = try self.readVector(types.Expr, readExpr);
+                return .{
+                    .type = .funcref,
+                    .init = .{ .exprs = init_exprs },
+                    .mode = .{ .active = .{ .table_idx = 0, .offset = offset } },
+                };
+            },
+            5 => {
+                const ty = try self.readRefType();
+                const init_exprs: []types.Expr = try self.readVector(types.Expr, readExpr);
+                return .{
+                    .type = ty,
+                    .init = .{ .exprs = init_exprs },
+                    .mode = .passive,
+                };
+            },
+            6 => {
+                const table_idx = try self.readU32();
+                const offset = try self.readExpr();
+                const ty = try self.readRefType();
+                const init_exprs: []types.Expr = try self.readVector(types.Expr, readExpr);
+                return .{
+                    .type = ty,
+                    .init = .{ .exprs = init_exprs },
+                    .mode = .{ .active = .{ .table_idx = table_idx, .offset = offset } },
+                };
+            },
+            7 => {
+                const ty = try self.readRefType();
+                const init_exprs: []types.Expr = try self.readVector(types.Expr, readExpr);
+                return .{
+                    .type = ty,
+                    .init = .{ .exprs = init_exprs },
+                    .mode = .declarative,
+                };
+            },
+            else => return error.InvalidElemFlags,
+        }
     }
 
     fn readLocals(self: *Parser) !types.Locals {
@@ -331,7 +417,10 @@ pub const Parser = struct {
                     .mode = .passive,
                 };
             },
-            else => return error.InvalidDataMode,
+            else => {
+                std.debug.print("Invalid data segment mode: {d}\n", .{mode_n});
+                return error.InvalidDataMode;
+            },
         }
     }
 
@@ -436,6 +525,8 @@ pub const Parser = struct {
             0x22 => .{ .local_tee = try self.readU32() },
             0x23 => .{ .global_get = try self.readU32() },
             0x24 => .{ .global_set = try self.readU32() },
+            0x25 => .{ .table_get = try self.readU32() },
+            0x26 => .{ .table_set = try self.readU32() },
             0x28 => .{ .i32_load = try self.readMemArg() },
             0x29 => .{ .i64_load = try self.readMemArg() },
             0x2A => .{ .f32_load = try self.readMemArg() },
@@ -609,6 +700,17 @@ pub const Parser = struct {
             0xC2 => .i64_extend8_s,
             0xC3 => .i64_extend16_s,
             0xC4 => .i64_extend32_s,
+            0xD0 => {
+                const ref_type = try self.readRefType();
+                return .{ .ref_null = ref_type };
+            },
+            0xD1 => {
+                return .ref_is_null;
+            },
+            0xD2 => {
+                const func_idx = try self.readU32();
+                return .{ .ref_func = func_idx };
+            },
             0xFC => {
                 const op = try self.readU32();
 
@@ -655,6 +757,32 @@ pub const Parser = struct {
                         const mem_idx = try self.readU32();
                         return .{ .memory_fill = mem_idx };
                     },
+                    12 => {
+                        const elem_idx = try self.readU32();
+                        const table_idx = try self.readU32();
+                        return .{ .table_init = .{ .table_idx = table_idx, .elem_idx = elem_idx } };
+                    },
+                    13 => {
+                        const elem_idx = try self.readU32();
+                        return .{ .elem_drop = elem_idx };
+                    },
+                    14 => {
+                        const src_table_idx = try self.readU32();
+                        const dst_table_idx = try self.readU32();
+                        return .{ .table_copy = .{ .src_table_idx = src_table_idx, .dst_table_idx = dst_table_idx } };
+                    },
+                    15 => {
+                        const table_idx = try self.readU32();
+                        return .{ .table_grow = table_idx };
+                    },
+                    16 => {
+                        const table_idx = try self.readU32();
+                        return .{ .table_size = table_idx };
+                    },
+                    17 => {
+                        const table_idx = try self.readU32();
+                        return .{ .table_fill = table_idx };
+                    },
                     else => {
                         return error.UnsupportedMiscellaneousOpcode;
                     },
@@ -671,7 +799,7 @@ pub const Parser = struct {
         return (try self.readInstructionSequence(&.{end_op_code})).instructions;
     }
 
-    fn readSectionHeader(self: *Parser, expected_id: u8) !?u32 {
+    fn readSectionSize(self: *Parser, expected_id: u8) !?u32 {
         const next_byte = self.peekByte() catch |err| {
             if (err == error.EndOfInput) return null;
             return err;
@@ -685,9 +813,37 @@ pub const Parser = struct {
         return null;
     }
 
+    fn readSectionHeader(self: *Parser, expected_id: u8) !?usize {
+        const section_size = try self.readSectionSize(expected_id) orelse return null;
+        const end = self.index + @as(usize, section_size);
+
+        if (end > self.bytes.len) {
+            return error.EndOfInput;
+        }
+
+        return end;
+    }
+
+    fn expectSectionEnd(self: *Parser, section_end: usize) !void {
+        if (self.index != section_end) {
+            return error.InvalidSectionSize;
+        }
+    }
+
     fn readCustomSection(self: *Parser, size: u32) !types.CustomSection {
+        const section_start = self.index;
         const name = try self.readName();
-        const content_size = size - @as(u32, @intCast(name.len));
+        const header_size = self.index - section_start;
+
+        if (header_size > size) {
+            return error.InvalidSectionSize;
+        }
+
+        const content_size = @as(usize, size) - header_size;
+        if (self.index + content_size > self.bytes.len) {
+            return error.EndOfInput;
+        }
+
         const content = self.bytes[self.index .. self.index + @as(usize, content_size)];
         self.index += @as(usize, content_size);
         return .{ .name = name, .data = content };
@@ -715,66 +871,90 @@ pub const Parser = struct {
     }
 
     fn readTypeSection(self: *Parser) ![]types.FuncType {
-        _ = try self.readSectionHeader(1) orelse return &.{};
-        return try self.readVector(types.FuncType, readFuncType);
+        const section_end = try self.readSectionHeader(1) orelse return &.{};
+        const result = try self.readVector(types.FuncType, readFuncType);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readImportSection(self: *Parser) ![]types.Import {
-        _ = try self.readSectionHeader(2) orelse return &.{};
-        return try self.readVector(types.Import, readImport);
+        const section_end = try self.readSectionHeader(2) orelse return &.{};
+        const result = try self.readVector(types.Import, readImport);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readFunctionSection(self: *Parser) ![]types.FuncIndex {
-        _ = try self.readSectionHeader(3) orelse return &.{};
-        return try self.readVector(types.FuncIndex, readU32);
+        const section_end = try self.readSectionHeader(3) orelse return &.{};
+        const result = try self.readVector(types.FuncIndex, readU32);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readTableSection(self: *Parser) ![]types.TableType {
-        _ = try self.readSectionHeader(4) orelse return &.{};
-        return try self.readVector(types.TableType, readTableType);
+        const section_end = try self.readSectionHeader(4) orelse return &.{};
+        const result = try self.readVector(types.TableType, readTableType);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readMemorySection(self: *Parser) ![]types.MemType {
-        _ = try self.readSectionHeader(5) orelse return &.{};
-        return try self.readVector(types.MemType, readMemType);
+        const section_end = try self.readSectionHeader(5) orelse return &.{};
+        const result = try self.readVector(types.MemType, readMemType);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readGlobalSection(self: *Parser) ![]types.Global {
-        _ = try self.readSectionHeader(6) orelse return &.{};
-        return try self.readVector(types.Global, readGlobal);
+        const section_end = try self.readSectionHeader(6) orelse return &.{};
+        const result = try self.readVector(types.Global, readGlobal);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readExportSection(self: *Parser) ![]types.Export {
-        _ = try self.readSectionHeader(7) orelse return &.{};
-        return try self.readVector(types.Export, readExport);
+        const section_end = try self.readSectionHeader(7) orelse return &.{};
+        const result = try self.readVector(types.Export, readExport);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readStartSection(self: *Parser) !?types.FuncIndex {
-        _ = try self.readSectionHeader(8) orelse return null;
-        return try self.readU32();
+        const section_end = try self.readSectionHeader(8) orelse return null;
+        const start = try self.readU32();
+        try self.expectSectionEnd(section_end);
+        return start;
     }
 
     fn readElementSection(self: *Parser) ![]types.Elem {
-        _ = try self.readSectionHeader(9) orelse return &.{};
-        return try self.readVector(types.Elem, readElem);
+        const section_end = try self.readSectionHeader(9) orelse return &.{};
+        const result = try self.readVector(types.Elem, readElem);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readDataCountSection(self: *Parser) !?u32 {
-        if (try self.readSectionHeader(12)) |_| {
-            return try self.readU32();
+        if (try self.readSectionHeader(12)) |section_end| {
+            const count = try self.readU32();
+            try self.expectSectionEnd(section_end);
+            return count;
         }
 
         return null;
     }
 
     fn readCodeSection(self: *Parser) ![]types.Code {
-        _ = try self.readSectionHeader(10) orelse return &.{};
-        return try self.readVector(types.Code, readCode);
+        const section_end = try self.readSectionHeader(10) orelse return &.{};
+        const result = try self.readVector(types.Code, readCode);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     fn readDataSection(self: *Parser) ![]types.Data {
-        _ = try self.readSectionHeader(11) orelse return &.{};
-        return try self.readVector(types.Data, readData);
+        const section_end = try self.readSectionHeader(11) orelse return &.{};
+        const result = try self.readVector(types.Data, readData);
+        try self.expectSectionEnd(section_end);
+        return result;
     }
 
     pub fn readModule(self: *Parser) !types.Module {

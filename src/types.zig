@@ -13,42 +13,51 @@ pub const GlobalIndex = u32;
 pub const LocalIndex = u32;
 pub const LabelIndex = u32;
 pub const DataIndex = u32;
+pub const ElemIndex = u32;
 
 pub const Name = []const u8;
 
-pub const ValType = enum {
-    i32,
-    i64,
-    f32,
-    f64,
+pub const NumType = enum(u8) {
+    i32 = 0x7F,
+    i64 = 0x7E,
+    f32 = 0x7D,
+    f64 = 0x7C,
 };
 
-pub const Value = union(enum) {
-    i32: i32,
-    i64: i64,
-    f32: f32,
-    f64: f64,
+pub const RefType = enum(u8) {
+    funcref = 0x70,
+    externref = 0x6F,
 
-    pub fn getType(self: Value) ValType {
+    pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         return switch (self) {
-            .i32 => .i32,
-            .i64 => .i64,
-            .f32 => .f32,
-            .f64 => .f64,
+            .funcref => try writer.writeAll("funcref"),
+            .externref => try writer.writeAll("externref"),
+        };
+    }
+};
+
+pub const ValType = enum(u8) {
+    i32 = 0x7F,
+    i64 = 0x7E,
+    f32 = 0x7D,
+    f64 = 0x7C,
+    funcref = 0x70,
+    externref = 0x6F,
+
+    pub fn isNumType(self: ValType) bool {
+        return switch (self) {
+            .i32, .i64, .f32, .f64 => true,
+            .funcref, .externref => false,
         };
     }
 
-    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        switch (self) {
-            .i32 => try writer.print("{d}", .{self.i32}),
-            .i64 => try writer.print("{d}", .{self.i64}),
-            .f32 => try writer.print("{d}", .{self.f32}),
-            .f64 => try writer.print("{d}", .{self.f64}),
-        }
+    pub fn isRefType(self: ValType) bool {
+        return switch (self) {
+            .i32, .i64, .f32, .f64 => false,
+            .funcref, .externref => true,
+        };
     }
 };
-
-pub const Result = Value;
 
 pub const ResultType = []const ValType;
 
@@ -81,12 +90,8 @@ pub const MemType = struct {
     limits: Limits,
 };
 
-pub const ElemType = enum {
-    funcref,
-};
-
 pub const TableType = struct {
-    elem_type: ElemType,
+    elem_type: RefType,
     limits: Limits,
 };
 
@@ -137,6 +142,16 @@ pub const Instr = union(enum) {
     local_tee: LocalIndex,
     global_get: GlobalIndex,
     global_set: GlobalIndex,
+
+    // Table instructions
+    table_get: TableIndex,
+    table_set: TableIndex,
+    table_init: struct { elem_idx: ElemIndex, table_idx: TableIndex },
+    elem_drop: ElemIndex,
+    table_copy: struct { dst_table_idx: TableIndex, src_table_idx: TableIndex },
+    table_grow: TableIndex,
+    table_size: TableIndex,
+    table_fill: TableIndex,
 
     // Memory instructions
     i32_load: MemoryInstrArg,
@@ -310,6 +325,11 @@ pub const Instr = union(enum) {
     i64_trunc_sat_f32_u,
     i64_trunc_sat_f64_s,
     i64_trunc_sat_f64_u,
+
+    // Reference instructions
+    ref_null: RefType,
+    ref_is_null,
+    ref_func: FuncIndex,
 };
 
 pub const Expr = []Instr;
@@ -337,10 +357,28 @@ pub const Export = struct {
     desc: ExportDesc,
 };
 
+pub const ElemMode = union(enum) {
+    passive,
+    active: struct { table_idx: TableIndex, offset: Expr },
+    declarative,
+};
+
+pub const ElemInit = union(enum) {
+    func_indices: []FuncIndex,
+    exprs: []Expr,
+
+    pub fn length(self: ElemInit) usize {
+        return switch (self) {
+            .func_indices => |indices| indices.len,
+            .exprs => |exprs| exprs.len,
+        };
+    }
+};
+
 pub const Elem = struct {
-    table: TableIndex,
-    offset: Expr,
-    init: []FuncIndex,
+    type: RefType,
+    init: ElemInit,
+    mode: ElemMode,
 };
 
 pub const Locals = struct {
