@@ -426,7 +426,7 @@ pub const Parser = struct {
             },
             0x11 => {
                 const type_idx = try self.readU32();
-                const table_idx = try self.readByte();
+                const table_idx = try self.readU32();
                 return .{ .call_indirect = .{ .type_idx = type_idx, .table_idx = table_idx } };
             },
             0x1A => .drop,

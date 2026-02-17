@@ -84,6 +84,8 @@ fn run(allocator: std.mem.Allocator) !void {
     var vm = try createVM(arena.allocator(), wasm_path.?, &host_env);
     defer vm.deinit();
 
+    _ = try vm.invokeStartFunc();
+
     if (print_bytecode) {
         var allocating_writer = std.Io.Writer.Allocating.init(arena.allocator());
         defer allocating_writer.deinit();
@@ -130,8 +132,6 @@ fn run(allocator: std.mem.Allocator) !void {
         if (results.len > 0) {
             std.debug.print("\n", .{});
         }
-    } else {
-        try vm.invokeStartFunc();
     }
 }
 
@@ -186,7 +186,7 @@ const HostEnv = struct {
     }
 
     fn outputChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const ctx: *HostEnv = @ptrCast(@alignCast(store.host_ctx));
+        const ctx = try store.getContext(HostEnv);
         const done = try stack.pop(i32);
         const char: u8 = @intCast(try stack.pop(i32));
         try ctx.output_buffer.append(ctx.allocator, char);
@@ -198,12 +198,12 @@ const HostEnv = struct {
     }
 
     fn getSourceFileLength(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const ctx: *HostEnv = @ptrCast(@alignCast(store.host_ctx));
+        const ctx = try store.getContext(HostEnv);
         try stack.push(i32, @intCast(ctx.preprocessed.len));
     }
 
     fn readSourceFileChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const ctx: *HostEnv = @ptrCast(@alignCast(store.host_ctx));
+        const ctx = try store.getContext(HostEnv);
         const idx: usize = @intCast(try stack.pop(i32));
 
         if (idx >= ctx.preprocessed.len) {

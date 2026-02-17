@@ -1528,6 +1528,14 @@ pub const Store = struct {
         self.globals.deinit(self.allocator);
     }
 
+    pub fn getContext(self: *Store, comptime T: type) !*T {
+        if (self.host_ctx) |ctx| {
+            return @ptrCast(@alignCast(ctx));
+        } else {
+            return error.NoHostContext;
+        }
+    }
+
     fn allocModule(
         self: *Store,
         allocator: Allocator,
@@ -2243,12 +2251,15 @@ pub const Runtime = struct {
         self.store.deinit();
     }
 
-    pub fn invokeStartFunc(self: *Runtime) !void {
+    /// Invokes the start function of the module, if it has one.
+    /// Returns true if a start function was invoked, false if the module has no start function.
+    pub fn invokeStartFunc(self: *Runtime) !bool {
         if (self.start_func_addr) |addr| {
             _ = try self.invokeFunc(addr);
-        } else {
-            return error.NoStartFunction;
+            return true;
         }
+
+        return false;
     }
 
     pub fn getExportByName(self: *Runtime, name: types.Name) !ExternVal {
@@ -2604,6 +2615,7 @@ pub const Runtime = struct {
                         const func_inst = self.store.funcs.items[func_addr];
 
                         if (!func_inst.getType().eql(call.func_type.*)) {
+                            std.debug.print("Indirect call type mismatch at pc: {d}: expected {any}, got {any}\n", .{ pc, call.func_type.*, func_inst.getType() });
                             return error.IndirectCallTypeMismatch;
                         }
 
