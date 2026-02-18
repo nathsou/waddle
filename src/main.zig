@@ -57,15 +57,8 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    var host_env = HostEnv.init(allocator);
-    defer host_env.deinit();
-    defer {
-        for (host_env.outputs.items) |output| {
-            std.debug.print("{s}", .{output});
-        }
-    }
-
-    var vm = try createVM(arena.allocator(), wasm_path.?, &host_env);
+    var host_ctx: ?*anyopaque = null;
+    var vm = try createVM(arena.allocator(), wasm_path.?, @ptrCast(&host_ctx));
     defer vm.deinit();
 
     _ = try vm.invokeStartFunc();
@@ -140,83 +133,62 @@ fn printUsage(program_name: []const u8) void {
     );
 }
 
-// host imports to run compote
-// https://github.com/nathsou/compote/blob/776f5270005606eae7a10373504f59bf79e27cf1/src/main.rs
-const HostEnv = struct {
-    const preprocessed =
-        \\int fib(int arg0);
-        \\
-        \\int main(void) {
-        \\    int n = 11;
-        \\    return fib(n);
-        \\}
-        \\
-        \\int fib(int n) {
-        \\    if (n == 0 || n == 1) {
-        \\        return n;
-        \\    } else {
-        \\        return fib(n - 1) + fib(n - 2);
-        \\    }
-        \\}
-    ;
+fn specTestPrintChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
+    const char_code: u8 = @intCast(try stack.pop(.i32));
+    _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
+}
 
-    outputs: std.ArrayList([]const u8),
-    output_buffer: std.ArrayList(u8),
-    allocator: std.mem.Allocator,
+const WasiSnapshotPreview1Host = struct {
+    const WasiErrNo = enum(u16) {
+        success = 0,
+        badf = 8,
+    };
 
-    fn init(allocator: std.mem.Allocator) HostEnv {
-        return HostEnv{
-            .allocator = allocator,
-            .outputs = .empty,
-            .output_buffer = .empty,
+    fn fd_write(stack: *runtime.ValueStack, mod: *runtime.ModuleInstance, store: *runtime.Store) !void {
+        const mem_inst = &store.mems.items[mod.mem_addrs[0]];
+        const args = stack.staticPopValues(.i32, 4);
+        const fd: u8 = @intCast(args[0]);
+        const iovs_ptr: usize = @intCast(args[1]);
+        const iovs_len: usize = @intCast(args[2]);
+        const nwritten: usize = @intCast(args[3]);
+        var total_bytes_written: usize = 0;
+        const host_fd = switch (fd) {
+            0 => std.posix.STDIN_FILENO,
+            1 => std.posix.STDOUT_FILENO,
+            2 => std.posix.STDERR_FILENO,
+            else => fd,
         };
-    }
 
-    fn deinit(self: *HostEnv) void {
-        self.output_buffer.deinit(self.allocator);
+        for (0..iovs_len) |i| {
+            const iov_ptr: u32 = @intCast(try mem_inst.read(.i32, iovs_ptr + i * 8 + 0));
+            const iov_len: u32 = @intCast(try mem_inst.read(.i32, iovs_ptr + i * 8 + 4));
+            const bytes = mem_inst.data[iov_ptr .. iov_ptr + iov_len];
+            const bytes_written = try std.posix.write(host_fd, bytes);
 
-        for (self.outputs.items) |output| {
-            self.allocator.free(output);
+            if (bytes_written != iov_len) {
+                break;
+            }
+
+            total_bytes_written += bytes_written;
         }
 
-        self.outputs.deinit(self.allocator);
+        try mem_inst.write(.i32, nwritten, @intCast(total_bytes_written));
+        try stack.push(.i32, @intCast(@intFromEnum(WasiErrNo.success)));
     }
 
-    fn printChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
-        const char_code: u8 = @intCast(try stack.pop(.i32));
-        _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
-    }
-
-    fn outputChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const ctx = try store.getContext(HostEnv);
-        const done = try stack.pop(.i32);
-        const char: u8 = @intCast(try stack.pop(.i32));
-        try ctx.output_buffer.append(ctx.allocator, char);
-
-        if (done != 0) {
-            try ctx.outputs.append(ctx.allocator, try ctx.output_buffer.toOwnedSlice(ctx.allocator));
-            ctx.output_buffer.items.len = 0;
-        }
-    }
-
-    fn getSourceFileLength(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
-        try stack.push(.i32, @intCast(preprocessed.len));
-    }
-
-    fn readSourceFileChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
-        const idx: usize = @intCast(try stack.pop(.i32));
-
-        if (idx >= preprocessed.len) {
-            return error.SourceFileCharIndexOutOfBounds;
-        }
-
-        const char: i32 = @intCast(preprocessed[idx]);
-        try stack.push(.i32, char);
+    fn getImports() [1]runtime.Store.Import {
+        return [_]runtime.Store.Import{
+            .{
+                .module = "wasi_snapshot_preview1",
+                .name = "fd_write",
+                .value = .{ .func = fd_write },
+            },
+        };
     }
 };
 
-fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_env: *HostEnv) !runtime.Runtime {
-    var store = runtime.Store.init(allocator, @ptrCast(host_env));
+fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_ctx: ?*anyopaque) !runtime.Runtime {
+    var store = runtime.Store.init(allocator, host_ctx);
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
     var file_read_buffer: [4096]u8 = undefined;
@@ -248,28 +220,8 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_env: *Ho
         return error.UnsupportedModuleFormat;
     }
 
-    const module_inst = try store.instantiate(module, &.{
-        .{
-            .module = "spectest",
-            .name = "print_char",
-            .value = .{ .func = HostEnv.printChar },
-        },
-        .{
-            .module = "host",
-            .name = "get_source_file_length",
-            .value = .{ .func = HostEnv.getSourceFileLength },
-        },
-        .{
-            .module = "host",
-            .name = "read_source_file_char",
-            .value = .{ .func = HostEnv.readSourceFileChar },
-        },
-        .{
-            .module = "host",
-            .name = "output_char",
-            .value = .{ .func = HostEnv.outputChar },
-        },
-    });
+    const imports = WasiSnapshotPreview1Host.getImports();
+    const module_inst = try store.instantiate(module, &imports);
 
     var start_func_addr: ?runtime.FuncAddr = null;
     if (module.start) |start_func_idx| {

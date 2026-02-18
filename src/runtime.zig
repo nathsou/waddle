@@ -49,7 +49,7 @@ pub const Value = union(ValType) {
         };
     }
 
-    fn static_encode(comptime VT: ValType, val: matchingType(VT)) u64 {
+    fn staticEncode(comptime VT: ValType, val: matchingType(VT)) u64 {
         return switch (VT) {
             .i32 => @as(u64, @as(u32, @bitCast(val))),
             .i64 => @as(u64, @bitCast(val)),
@@ -60,7 +60,7 @@ pub const Value = union(ValType) {
         };
     }
 
-    fn static_decode(comptime VT: ValType, val: u64) matchingType(VT) {
+    fn staticDecode(comptime VT: ValType, val: u64) matchingType(VT) {
         return switch (VT) {
             .i32 => @bitCast(@as(u32, @truncate(val))),
             .i64 => @bitCast(val),
@@ -73,24 +73,34 @@ pub const Value = union(ValType) {
 
     fn encode(self: Value) u64 {
         return switch (self) {
-            .i32 => |n| static_encode(.i32, n),
-            .i64 => |n| static_encode(.i64, n),
-            .f32 => |x| static_encode(.f32, x),
-            .f64 => |x| static_encode(.f64, x),
-            .funcref => |func_ref| static_encode(.funcref, func_ref),
-            .externref => |ref_ptr| static_encode(.externref, ref_ptr),
+            .i32 => |n| staticEncode(.i32, n),
+            .i64 => |n| staticEncode(.i64, n),
+            .f32 => |x| staticEncode(.f32, x),
+            .f64 => |x| staticEncode(.f64, x),
+            .funcref => |func_ref| staticEncode(.funcref, func_ref),
+            .externref => |ref_ptr| staticEncode(.externref, ref_ptr),
         };
     }
 
     fn decode(val_type: ValType, val: u64) Value {
         return switch (val_type) {
-            .i32 => .{ .i32 = static_decode(.i32, val) },
-            .i64 => .{ .i64 = static_decode(.i64, val) },
-            .f32 => .{ .f32 = static_decode(.f32, val) },
-            .f64 => .{ .f64 = static_decode(.f64, val) },
-            .funcref => .{ .funcref = static_decode(.funcref, val) },
-            .externref => .{ .externref = static_decode(.externref, val) },
+            .i32 => .{ .i32 = staticDecode(.i32, val) },
+            .i64 => .{ .i64 = staticDecode(.i64, val) },
+            .f32 => .{ .f32 = staticDecode(.f32, val) },
+            .f64 => .{ .f64 = staticDecode(.f64, val) },
+            .funcref => .{ .funcref = staticDecode(.funcref, val) },
+            .externref => .{ .externref = staticDecode(.externref, val) },
         };
+    }
+
+    pub fn fromBytes(comptime VT: ValType, bytes: []const u8) !matchingType(VT) {
+        const T = matchingType(VT);
+        if (bytes.len != @sizeOf(T)) return error.InvalidByteSliceLength;
+        return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
+    }
+
+    pub fn toBytes(comptime VT: ValType, val: matchingType(VT)) [@sizeOf(matchingType(VT))]u8 {
+        return std.mem.toBytes(val);
     }
 };
 
@@ -1970,7 +1980,7 @@ pub const Store = struct {
                         }
 
                         const func_addr = module_inst.func_addrs[func_idx_usize];
-                        elem_inst.refs[j] = Value.static_encode(.funcref, func_addr);
+                        elem_inst.refs[j] = Value.staticEncode(.funcref, func_addr);
                     }
                 },
                 .exprs => |exprs| {
@@ -2084,7 +2094,7 @@ pub const Store = struct {
         global: GlobalAddr,
     };
 
-    const Import = struct {
+    pub const Import = struct {
         module: types.Name,
         name: types.Name,
         value: ImportVal,
@@ -2322,8 +2332,8 @@ const TableInstance = struct {
 
         const encoded_ref = self.elem[idx];
         return switch (self.type) {
-            .funcref => .{ .funcref = Value.static_decode(.funcref, encoded_ref) },
-            .externref => .{ .externref = Value.static_decode(.externref, encoded_ref) },
+            .funcref => .{ .funcref = Value.staticDecode(.funcref, encoded_ref) },
+            .externref => .{ .externref = Value.staticDecode(.externref, encoded_ref) },
         };
     }
 
@@ -2337,8 +2347,8 @@ const TableInstance = struct {
         }
 
         const encoded_ref: u64 = switch (self.type) {
-            .funcref => Value.static_encode(.funcref, val.funcref),
-            .externref => Value.static_encode(.externref, val.externref),
+            .funcref => Value.staticEncode(.funcref, val.funcref),
+            .externref => Value.staticEncode(.externref, val.externref),
         };
 
         self.elem[idx] = encoded_ref;
@@ -2350,6 +2360,26 @@ const page_size: usize = 65_536;
 const MemoryInstance = struct {
     data: []types.Byte,
     max: ?u32,
+
+    pub fn read(self: *const MemoryInstance, comptime VT: ValType, offset: usize) !Value.matchingType(VT) {
+        const byte_offset = offset + @sizeOf(Value.matchingType(VT));
+        if (byte_offset > self.data.len) {
+            return error.MemoryAccessOutOfBounds;
+        }
+
+        const bytes = self.data[offset..byte_offset];
+        return Value.fromBytes(VT, bytes);
+    }
+
+    pub fn write(self: *MemoryInstance, comptime VT: ValType, offset: usize, val: Value.matchingType(VT)) !void {
+        const byte_offset = offset + @sizeOf(Value.matchingType(VT));
+        if (byte_offset > self.data.len) {
+            return error.MemoryAccessOutOfBounds;
+        }
+
+        const bytes = Value.toBytes(VT, val);
+        @memcpy(self.data[offset..byte_offset], &bytes);
+    }
 };
 
 const GlobalInstance = struct {
@@ -2430,24 +2460,12 @@ pub const ValueStack = struct {
         };
     }
 
-    fn matchingValType(comptime T: type) ValType {
-        return switch (T) {
-            i32 => .i32,
-            i64 => .i64,
-            f32 => .f32,
-            f64 => .f64,
-            FuncRef => .funcref,
-            ExternRef => .externref,
-            else => unreachable,
-        };
-    }
-
     pub fn push(self: *Self, comptime VT: ValType, val: Value.matchingType(VT)) !void {
         if (self.top >= Size) {
             return error.StackOverflow;
         }
 
-        self.values[self.top] = Value.static_encode(VT, val);
+        self.values[self.top] = Value.staticEncode(VT, val);
         self.types[self.top] = VT;
         self.top += 1;
     }
@@ -2471,7 +2489,7 @@ pub const ValueStack = struct {
 
         std.debug.assert(self.types[self.top] == VT);
 
-        return Value.static_decode(VT, self.values[self.top]);
+        return Value.staticDecode(VT, self.values[self.top]);
     }
 
     pub fn popValue(self: *Self) !Value {
@@ -2499,6 +2517,17 @@ pub const ValueStack = struct {
             val.* = self.getValue(self.top + i);
         }
 
+        return vals;
+    }
+
+    pub fn staticPopValues(self: *Self, comptime VT: ValType, comptime N: comptime_int) [N]Value.matchingType(VT) {
+        var vals: [N]Value.matchingType(VT) = undefined;
+
+        inline for (0..N) |i| {
+            vals[i] = Value.staticDecode(VT, self.values[self.top - N + i]);
+        }
+
+        self.top -= N;
         return vals;
     }
 
@@ -2662,14 +2691,7 @@ pub const Runtime = struct {
     }
 
     fn popValues(self: *Runtime, comptime VT: ValType, comptime N: comptime_int) [N]Value.matchingType(VT) {
-        var vals: [N]Value.matchingType(VT) = undefined;
-
-        inline for (0..N) |i| {
-            vals[i] = Value.static_decode(VT, self.stack.values[self.stack.top - N + i]);
-        }
-
-        self.stack.top -= N;
-        return vals;
+        return self.stack.staticPopValues(VT, N);
     }
 
     fn peek(self: *Runtime) !Value {
@@ -2905,7 +2927,7 @@ pub const Runtime = struct {
                         return error.InvalidIndirectCallIndex;
                     }
 
-                    if (Value.static_decode(.funcref, table_inst.elem[i])) |func_addr| {
+                    if (Value.staticDecode(.funcref, table_inst.elem[i])) |func_addr| {
                         const func_inst = self.store.funcs.items[func_addr];
 
                         if (!func_inst.getType().eql(call.func_type.*)) {
