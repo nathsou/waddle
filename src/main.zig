@@ -7,23 +7,6 @@ const runtime = waddle.runtime;
 const types = waddle.types;
 const Value = runtime.Value;
 
-const source =
-    \\int fib(int arg0);
-    \\
-    \\int main(void) {
-    \\    int n = 11;
-    \\    return fib(n);
-    \\}
-    \\
-    \\int fib(int n) {
-    \\    if (n == 0 || n == 1) {
-    \\        return n;
-    \\    } else {
-    \\        return fib(n - 1) + fib(n - 2);
-    \\    }
-    \\}
-;
-
 pub fn main() !void {
     if (builtin.mode == .Debug) {
         var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
@@ -74,7 +57,7 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    var host_env = HostEnv.init(allocator, source);
+    var host_env = HostEnv.init(allocator);
     defer host_env.deinit();
     defer {
         for (host_env.outputs.items) |output| {
@@ -160,15 +143,30 @@ fn printUsage(program_name: []const u8) void {
 // host imports to run compote
 // https://github.com/nathsou/compote/blob/776f5270005606eae7a10373504f59bf79e27cf1/src/main.rs
 const HostEnv = struct {
-    preprocessed: []const u8,
+    const preprocessed =
+        \\int fib(int arg0);
+        \\
+        \\int main(void) {
+        \\    int n = 11;
+        \\    return fib(n);
+        \\}
+        \\
+        \\int fib(int n) {
+        \\    if (n == 0 || n == 1) {
+        \\        return n;
+        \\    } else {
+        \\        return fib(n - 1) + fib(n - 2);
+        \\    }
+        \\}
+    ;
+
     outputs: std.ArrayList([]const u8),
     output_buffer: std.ArrayList(u8),
     allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator, preprocessed: []const u8) HostEnv {
+    fn init(allocator: std.mem.Allocator) HostEnv {
         return HostEnv{
             .allocator = allocator,
-            .preprocessed = preprocessed,
             .outputs = .empty,
             .output_buffer = .empty,
         };
@@ -185,14 +183,14 @@ const HostEnv = struct {
     }
 
     fn printChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
-        const char_code: u8 = @intCast(try stack.pop(i32));
+        const char_code: u8 = @intCast(try stack.pop(.i32));
         _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
     }
 
     fn outputChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
         const ctx = try store.getContext(HostEnv);
-        const done = try stack.pop(i32);
-        const char: u8 = @intCast(try stack.pop(i32));
+        const done = try stack.pop(.i32);
+        const char: u8 = @intCast(try stack.pop(.i32));
         try ctx.output_buffer.append(ctx.allocator, char);
 
         if (done != 0) {
@@ -201,21 +199,19 @@ const HostEnv = struct {
         }
     }
 
-    fn getSourceFileLength(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const ctx = try store.getContext(HostEnv);
-        try stack.push(i32, @intCast(ctx.preprocessed.len));
+    fn getSourceFileLength(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
+        try stack.push(.i32, @intCast(preprocessed.len));
     }
 
-    fn readSourceFileChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const ctx = try store.getContext(HostEnv);
-        const idx: usize = @intCast(try stack.pop(i32));
+    fn readSourceFileChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
+        const idx: usize = @intCast(try stack.pop(.i32));
 
-        if (idx >= ctx.preprocessed.len) {
+        if (idx >= preprocessed.len) {
             return error.SourceFileCharIndexOutOfBounds;
         }
 
-        const char: i32 = @intCast(ctx.preprocessed[idx]);
-        try stack.push(i32, char);
+        const char: i32 = @intCast(preprocessed[idx]);
+        try stack.push(.i32, char);
     }
 };
 
