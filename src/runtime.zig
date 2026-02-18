@@ -1837,6 +1837,7 @@ pub const Store = struct {
             .elem_addrs = elem_addrs,
             .exports = exports,
             .exports_by_name = .init(allocator),
+            .start_addr = null,
         };
 
         errdefer module_inst.deinit(self.allocator);
@@ -1915,6 +1916,15 @@ pub const Store = struct {
             next_func_idx += 1;
             local_func_idx += 1;
             try self.funcs.append(self.allocator, func_inst);
+        }
+
+        if (module.start) |start_idx| {
+            const start_idx_usize = @as(usize, start_idx);
+            if (start_idx_usize >= module_inst.func_addrs.len) {
+                return error.InvalidStartFunctionIndex;
+            }
+
+            module_inst.start_addr = module_inst.func_addrs[start_idx_usize];
         }
 
         // Allocate tables
@@ -2100,16 +2110,14 @@ pub const Store = struct {
         value: ImportVal,
     };
 
-    fn lookupImport(module: types.Name, name: types.Name, imports: []const Import) !ImportVal {
+    fn lookupImport(module: types.Name, name: types.Name, imports: []const Import) ?ImportVal {
         for (imports) |import| {
             if (std.mem.eql(u8, import.module, module) and std.mem.eql(u8, import.name, name)) {
                 return import.value;
             }
         }
 
-        std.debug.print("Import not found: {s}.{s}\n", .{ module, name });
-
-        return error.ImportNotFound;
+        return null;
     }
 
     fn initTable(
@@ -2153,28 +2161,43 @@ pub const Store = struct {
         defer extern_vals.deinit(self.allocator);
 
         for (module.imports) |import| {
-            const import_val = try lookupImport(import.module, import.name, imports);
-
-            switch (import.desc) {
-                .func => |func_type_index| {
-                    switch (import_val) {
-                        .func => |host_func| {
-                            const func_type = module.types[@as(usize, func_type_index)];
-                            const func_addr = try self.registerHostFunc(func_type, host_func);
-                            try extern_vals.append(self.allocator, .{ .func = func_addr });
-                        },
-                        else => return error.InvalidFuncImport,
+            if (lookupImport(import.module, import.name, imports)) |import_val| {
+                switch (import.desc) {
+                    .func => |func_type_index| {
+                        switch (import_val) {
+                            .func => |host_func| {
+                                const func_type = module.types[@as(usize, func_type_index)];
+                                const func_addr = try self.registerHostFunc(func_type, host_func);
+                                try extern_vals.append(self.allocator, .{ .func = func_addr });
+                            },
+                            else => return error.InvalidFuncImport,
+                        }
+                    },
+                    .table => {
+                        return error.TableImportNotSupported;
+                    },
+                    .mem => {
+                        return error.MemImportNotSupported;
+                    },
+                    .global => {
+                        const addr = switch (import_val) {
+                            .global => |addr| addr,
+                            else => return error.InvalidGlobalImport,
+                        };
+                        global_extern_vals[global_import_idx] = addr;
+                        global_import_idx += 1;
+                        try extern_vals.append(self.allocator, .{ .global = addr });
+                    },
+                }
+            } else {
+                // list all missing imports
+                for (module.imports) |imp| {
+                    if (lookupImport(imp.module, imp.name, imports) == null) {
+                        std.debug.print("Missing import: {s}.{s}\n", .{ imp.module, imp.name });
                     }
-                },
-                .table => {},
-                .mem => {},
-                .global => {
-                    global_extern_vals[global_import_idx] = switch (import_val) {
-                        .global => |addr| addr,
-                        else => return error.InvalidGlobalImport,
-                    };
-                    global_import_idx += 1;
-                },
+                }
+
+                return error.MissingImport;
             }
         }
 
@@ -2280,6 +2303,7 @@ pub const ModuleInstance = struct {
     elem_addrs: []ElemAddr,
     exports: []ExportInstance,
     exports_by_name: std.StringHashMap(ExternVal),
+    start_addr: ?FuncAddr,
 
     pub fn deinit(self: *ModuleInstance, allocator: Allocator) void {
         allocator.free(self.func_addrs);
@@ -2549,9 +2573,8 @@ pub const Runtime = struct {
     stack: ValueStack,
     call_stack: FixedSizedStack(Frame, 16384),
     module: *ModuleInstance,
-    start_func_addr: ?FuncAddr,
 
-    pub fn init(allocator: Allocator, store: Store, module: *ModuleInstance, start_func_addr: ?FuncAddr) !Runtime {
+    pub fn init(allocator: Allocator, store: Store, module: *ModuleInstance) !Runtime {
         var lowering = try BytecodeLowering.init(allocator, &store);
         defer lowering.deinit();
 
@@ -2561,7 +2584,6 @@ pub const Runtime = struct {
             .bytecode = try lowering.lower(),
             .stack = .init(),
             .call_stack = .init(),
-            .start_func_addr = start_func_addr,
             .module = module,
         };
     }
@@ -2576,7 +2598,7 @@ pub const Runtime = struct {
     /// Invokes the start function of the module, if it has one.
     /// Returns true if a start function was invoked, false if the module has no start function.
     pub fn invokeStartFunc(self: *Runtime) !bool {
-        if (self.start_func_addr) |addr| {
+        if (self.module.start_addr) |addr| {
             _ = try self.invokeFunc(addr);
             return true;
         }

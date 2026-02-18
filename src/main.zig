@@ -201,38 +201,12 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_ctx: ?*a
         module = try parser.readModule();
     } else if (std.ascii.endsWithIgnoreCase(module_path, ".wat")) {
         var parser = try wat.Parser.init(bytes, allocator);
-        const wat_module = try parser.parseModule();
-        module = types.Module{
-            .custom = &.{},
-            .types = wat_module.types,
-            .imports = wat_module.imports,
-            .functions = wat_module.functions,
-            .tables = wat_module.tables,
-            .memories = wat_module.memories,
-            .globals = wat_module.globals,
-            .exports = wat_module.exports,
-            .start = wat_module.start,
-            .elements = wat_module.elements,
-            .codes = wat_module.codes,
-            .data = wat_module.data,
-        };
+        module = try parser.parseModule();
     } else {
         return error.UnsupportedModuleFormat;
     }
 
     const imports = WasiSnapshotPreview1Host.getImports();
     const module_inst = try store.instantiate(module, &imports);
-
-    var start_func_addr: ?runtime.FuncAddr = null;
-    if (module.start) |start_func_idx| {
-        const start_func_idx_usize = @as(usize, start_func_idx);
-
-        if (start_func_idx_usize >= module_inst.func_addrs.len) {
-            return error.InvalidStartFuncIndex;
-        }
-
-        start_func_addr = module_inst.func_addrs[start_func_idx_usize];
-    }
-
-    return try runtime.Runtime.init(allocator, store, module_inst, start_func_addr);
+    return try runtime.Runtime.init(allocator, store, module_inst);
 }
