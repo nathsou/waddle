@@ -21,29 +21,33 @@ pub const WasiSnapshotPreview1 = struct {
 
     allocator: std.mem.Allocator,
     preopen_dirs: []Preopen,
+    vm_args: []const []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, preopen_dir_paths: []const []const u8) !WasiSnapshotPreview1 {
+    pub fn init(allocator: std.mem.Allocator, preopen_dir_paths: []const []const u8, vm_args: []const []const u8) !WasiSnapshotPreview1 {
         var preopens = try allocator.alloc(Preopen, preopen_dir_paths.len);
         errdefer allocator.free(preopens);
 
         for (preopen_dir_paths, 0..) |dir_path, i| {
-            const host_dir = std.fs.cwd().openDir(dir_path, .{}) catch |err| {
-                return err;
-            };
+            const host_dir = try std.fs.cwd().openDir(dir_path, .{});
+
+            // Strip trailing slashes so WASI prefix matching is consistent whether
+            // the user passes "/foo/bar" or "/foo/bar/".
+            const name = std.mem.trimEnd(u8, dir_path, "/");
 
             // add 3 to skip over stdin, stdout, and stderr which are reserved for the first 3 WASI fds
-            preopens[i] = .{ .name = dir_path, .wasi_fd = @intCast(i + 3), .host_fd = host_dir.fd };
+            preopens[i] = .{ .name = name, .wasi_fd = @intCast(i + 3), .host_fd = host_dir.fd };
         }
 
         return .{
             .allocator = allocator,
             .preopen_dirs = preopens,
+            .vm_args = vm_args,
         };
     }
 
     pub fn deinit(self: *WasiSnapshotPreview1) void {
-        for (self.preopen_dirs, 0..) |_, i| {
-            _ = std.posix.close(@intCast(i));
+        for (self.preopen_dirs) |preopen| {
+            std.posix.close(preopen.host_fd);
         }
 
         self.allocator.free(self.preopen_dirs);
@@ -53,6 +57,46 @@ pub const WasiSnapshotPreview1 = struct {
         success = 0,
         badf = 8,
     };
+
+    fn argsSizesGet(vm: *Runtime) !void {
+        const ctx = try vm.store.getContext(WasiSnapshotPreview1);
+        const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
+        const args = vm.stack.staticPopValues(.i32, 2);
+        const argc_ptr: usize = @intCast(args[0]);
+        const argv_buf_size_ptr: usize = @intCast(args[1]);
+
+        var total_buf_size: usize = 0;
+        for (ctx.vm_args) |arg| {
+            total_buf_size += arg.len + 1; // +1 for null terminator
+        }
+
+        try mem_inst.write(.i32, argc_ptr, @intCast(ctx.vm_args.len));
+        try mem_inst.write(.i32, argv_buf_size_ptr, @intCast(total_buf_size));
+        try pushErrNo(vm, .success);
+    }
+
+    fn argsGet(vm: *Runtime) !void {
+        const ctx = try vm.store.getContext(WasiSnapshotPreview1);
+        const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
+        const args = vm.stack.staticPopValues(.i32, 2);
+        const argv_ptr: usize = @intCast(args[0]);
+        const argv_buf_ptr: usize = @intCast(args[1]);
+
+        var buf_offset: usize = 0;
+        for (ctx.vm_args, 0..) |arg, idx| {
+            // Write pointer to this arg string into the argv array
+            const str_ptr: u32 = @intCast(argv_buf_ptr + buf_offset);
+            try mem_inst.write(.i32, argv_ptr + idx * 4, @bitCast(str_ptr));
+
+            // Write the arg string bytes followed by a null terminator
+            try mem_inst.writeBytes(argv_buf_ptr + buf_offset, arg);
+            try mem_inst.writeBytes(argv_buf_ptr + buf_offset + arg.len, &.{0});
+
+            buf_offset += arg.len + 1;
+        }
+
+        try pushErrNo(vm, .success);
+    }
 
     fn pushErrNo(vm: *Runtime, errno: ErrNo) !void {
         try vm.stack.push(.i32, @intCast(@intFromEnum(errno)));
@@ -237,7 +281,6 @@ pub const WasiSnapshotPreview1 = struct {
 
             const mode: std.posix.mode_t = 0o644;
             const sub_path = mem_inst.data[path_ptr .. path_ptr + path_len];
-
             const res_fd = try std.posix.openat(host_dir_fd, sub_path, flags, mode);
             try mem_inst.write(.i32, opened_fd_ptr, @intCast(res_fd));
             errno = .success;
@@ -268,42 +311,54 @@ pub const WasiSnapshotPreview1 = struct {
         std.posix.exit(exit_code);
     }
 
-    pub fn getImports() [7]runtime.Store.Import {
+    pub fn getImports() [9]runtime.Store.Import {
+        const scope = "wasi_snapshot_preview1";
+
         return [_]runtime.Store.Import{
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "fd_read",
                 .value = .{ .func = fdRead },
             },
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "fd_write",
                 .value = .{ .func = fdWrite },
             },
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "fd_prestat_get",
                 .value = .{ .func = fdPrestatGet },
             },
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "fd_prestat_dir_name",
                 .value = .{ .func = fdPrestatDirName },
             },
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "path_open",
                 .value = .{ .func = pathOpen },
             },
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "fd_close",
                 .value = .{ .func = fdClose },
             },
             .{
-                .module = "wasi_snapshot_preview1",
+                .module = scope,
                 .name = "proc_exit",
                 .value = .{ .func = procExit },
+            },
+            .{
+                .module = scope,
+                .name = "args_sizes_get",
+                .value = .{ .func = argsSizesGet },
+            },
+            .{
+                .module = scope,
+                .name = "args_get",
+                .value = .{ .func = argsGet },
             },
         };
     }

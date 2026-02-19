@@ -24,8 +24,8 @@ pub fn main() !void {
 fn run(allocator: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-
-    const args = try std.process.argsAlloc(arena.allocator());
+    const arena_alloc = arena.allocator();
+    const args = try std.process.argsAlloc(arena_alloc);
 
     if (args.len == 1) {
         printUsage(args[0]);
@@ -35,20 +35,33 @@ fn run(allocator: std.mem.Allocator) !void {
     var print_bytecode = false;
     var wasm_path: ?[]const u8 = null;
     var invoke_idx: ?usize = null;
+    var preopen_dirs: std.ArrayList([]const u8) = .empty;
+    var vm_args: []const []const u8 = &.{};
 
-    for (args[1..], 1..) |arg, idx| {
-        if (std.mem.eql(u8, arg, "--invoke")) {
-            invoke_idx = idx;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            vm_args = args[i + 1 ..];
+            break;
+        } else if (std.mem.eql(u8, arg, "--invoke")) {
+            invoke_idx = i;
             break;
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print-bytecode")) {
             print_bytecode = true;
+        } else if (std.mem.eql(u8, arg, "--dir")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: missing <path> after --dir\n", .{});
+                printUsage(args[0]);
+                return;
+            }
+            try preopen_dirs.append(arena_alloc, args[i]);
         } else if (wasm_path == null) {
             wasm_path = arg;
         } else {
-            std.debug.print(
-                "Error: unexpected argument before --invoke: {s}\n",
-                .{arg},
-            );
+            std.debug.print("Error: unexpected argument: {s}\n", .{arg});
+            printUsage(args[0]);
             return;
         }
     }
@@ -59,16 +72,19 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    const preopen_dirs = [_][]const u8{"/home/nathan/code/moonbit/compote"};
-    var host_ctx = try wasi_host.WasiSnapshotPreview1.init(allocator, &preopen_dirs);
+    // prepend the wasm path to the vm args
+    const full_vm_args = try arena_alloc.alloc([]const u8, vm_args.len + 1);
+    defer arena_alloc.free(full_vm_args);
+    full_vm_args[0] = wasm_path.?;
+    @memcpy(full_vm_args[1..], vm_args);
+    var host_ctx = try wasi_host.WasiSnapshotPreview1.init(allocator, preopen_dirs.items, full_vm_args);
     defer host_ctx.deinit();
-    var vm = try createVM(arena.allocator(), wasm_path.?, @ptrCast(&host_ctx));
+    var vm = try createVM(arena_alloc, wasm_path.?, @ptrCast(&host_ctx));
     defer vm.deinit();
-
     _ = try vm.invokeStartFunc();
 
     if (print_bytecode) {
-        var allocating_writer = std.Io.Writer.Allocating.init(arena.allocator());
+        var allocating_writer = std.Io.Writer.Allocating.init(arena_alloc);
         defer allocating_writer.deinit();
         try vm.bytecode.format(&allocating_writer.writer);
         // Write accumulated buffer to stderr
@@ -84,7 +100,6 @@ fn run(allocator: std.mem.Allocator) !void {
 
         const func_name = args[invoke_flag_idx + 1];
         const func_arg_strings = args[invoke_flag_idx + 2 ..];
-
         const func_type = try vm.getExportedFuncType(func_name);
         if (func_type.params.len != func_arg_strings.len) {
             std.debug.print(
@@ -96,17 +111,16 @@ fn run(allocator: std.mem.Allocator) !void {
 
         const func_args = try allocator.alloc(Value, func_type.params.len);
         defer allocator.free(func_args);
-        for (func_type.params, 0..) |param_type, i| {
-            func_args[i] = try parseValue(func_arg_strings[i], param_type);
+        for (func_type.params, 0..) |param_type, j| {
+            func_args[j] = try parseValue(func_arg_strings[j], param_type);
         }
 
         const results = try vm.invokeExportedFunc(allocator, func_name, func_args);
         defer allocator.free(results);
-
-        for (results, 0..) |res, i| {
+        for (results, 0..) |res, j| {
             std.debug.print("{f}", .{res});
 
-            if (i != results.len - 1) {
+            if (j != results.len - 1) {
                 std.debug.print(", ", .{});
             }
         }
@@ -139,15 +153,16 @@ fn parseValue(raw: []const u8, val_type: types.ValType) !Value {
 
 fn printUsage(program_name: []const u8) void {
     std.debug.print(
-        "Usage: {s} [options] <file.wasm/.wat> [--invoke <func_name> [<func_args>]]\n" ++
+        "Usage: {s} [options] <file.wasm/.wat> [--invoke <func_name> [<func_args>]] [-- <vm_args>]\n" ++
             "Options:\n" ++
-            "  -p, --print-bytecode  Print bytecode instructions\n",
+            "  -p, --print-bytecode   Print bytecode instructions\n" ++
+            "  --dir <path>           Preopen a host directory for WASI (repeatable)\n",
         .{program_name},
     );
 }
 
-fn specTestPrintChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: *runtime.Store) !void {
-    const char_code: u8 = @intCast(try stack.pop(.i32));
+fn specTestPrintChar(vm: *Runtime) !void {
+    const char_code: u8 = @intCast(try vm.stack.pop(.i32));
     _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
 }
 

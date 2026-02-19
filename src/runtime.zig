@@ -2828,7 +2828,7 @@ pub const Runtime = struct {
     fn memLoad(self: *Runtime, comptime T: type, memarg: MemArg) !T {
         const i = self.pop(.i32);
         const N = @divExact(@typeInfo(T).int.bits, 8);
-        const effective_addr = @as(usize, @intCast(i)) + @as(usize, memarg.offset);
+        const effective_addr = @as(usize, @intCast(@as(u32, @bitCast(i)))) + @as(usize, memarg.offset);
         const mem_inst = &self.store.mems.items[memarg.mem_addr];
 
         if (effective_addr + N > mem_inst.data.len) {
@@ -2842,7 +2842,7 @@ pub const Runtime = struct {
     fn memStore(self: *Runtime, comptime T: type, memarg: MemArg, val: T) !void {
         const i = self.pop(.i32);
         const N = @divExact(@typeInfo(T).int.bits, 8);
-        const effective_addr = @as(usize, @intCast(i)) + @as(usize, memarg.offset);
+        const effective_addr = @as(usize, @intCast(@as(u32, @bitCast(i)))) + @as(usize, memarg.offset);
         const mem_inst = &self.store.mems.items[memarg.mem_addr];
 
         if (effective_addr + N > mem_inst.data.len) {
@@ -2882,7 +2882,7 @@ pub const Runtime = struct {
                     }
                 },
                 .br_table => |table| {
-                    const i: usize = @intCast(self.pop(.i32));
+                    const i: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
 
                     if (i < table.label_pcs.len) {
                         pc = table.label_pcs[i];
@@ -2945,7 +2945,7 @@ pub const Runtime = struct {
                     }
                 },
                 .call_indirect => |call| {
-                    const i: usize = @intCast(self.pop(.i32));
+                    const i: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
                     const table_inst = &self.store.tables.items[call.table_addr];
 
                     if (i >= table_inst.elem.len) {
@@ -3059,14 +3059,10 @@ pub const Runtime = struct {
                 },
                 .super_duplicate => |count| {
                     const last_val_idx = self.stack.top - 1;
-                    const val_ty = self.stack.types[last_val_idx];
                     const val = self.stack.values[last_val_idx];
-
-                    for (self.stack.top..self.stack.top + count) |i| {
-                        self.stack.values[i] = val;
-                        self.stack.types[i] = val_ty;
-                    }
-
+                    const val_ty = self.stack.types[last_val_idx];
+                    @memset(self.stack.values[self.stack.top..][0..count], val);
+                    @memset(self.stack.types[self.stack.top..][0..count], val_ty);
                     self.stack.top += count;
                 },
                 .drop => {
@@ -3378,9 +3374,9 @@ pub const Runtime = struct {
                 .memory_copy => |arg| {
                     const src_mem = &self.store.mems.items[arg.src_mem];
                     const dst_mem = &self.store.mems.items[arg.dst_mem];
-                    const n: usize = @intCast(self.pop(.i32));
-                    const src_start: usize = @intCast(self.pop(.i32));
-                    const dst_start: usize = @intCast(self.pop(.i32));
+                    const n: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
+                    const src_start: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
+                    const dst_start: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
                     const src_end = src_start + n;
                     const dst_end = dst_start + n;
 
@@ -3846,7 +3842,7 @@ pub const Runtime = struct {
                 },
                 .table_get => |table_idx| {
                     const table_inst = &self.store.tables.items[table_idx];
-                    const elem_idx: usize = @intCast(self.pop(.i32));
+                    const elem_idx: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
 
                     if (elem_idx >= table_inst.elem.len) {
                         return error.TableGetOutOfBounds;
@@ -3858,7 +3854,7 @@ pub const Runtime = struct {
                 .table_set => |table_idx| {
                     const table_inst = &self.store.tables.items[table_idx];
                     const ref = self.popValue();
-                    const elem_idx: usize = @intCast(self.pop(.i32));
+                    const elem_idx: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
 
                     if (elem_idx >= table_inst.elem.len) {
                         return error.TableSetOutOfBounds;
