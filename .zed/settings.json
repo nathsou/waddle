@@ -1,0 +1,10 @@
+{
+  "lsp": {
+    "zls": {
+      "initialization_options": {
+        "build_on_save": true,
+        "build_on_save_step": "check",
+      },
+    },
+  },
+}

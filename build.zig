@@ -142,6 +142,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // A check step used by ZLS to type-check the project on save without
+    // emitting any build artifacts. This is faster than a full build because
+    // the Zig compiler skips linking and installation. Configure ZLS to use
+    // this step via `build_on_save_step: "check"` in your editor settings.
+    const exe_check = b.addExecutable(.{
+        .name = "waddle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "waddle", .module = mod },
+            },
+        }),
+    });
+
+    const check = b.step("check", "Check if waddle compiles");
+    check.dependOn(&exe_check.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

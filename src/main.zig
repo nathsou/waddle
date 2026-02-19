@@ -1,11 +1,13 @@
 const std = @import("std");
 const waddle = @import("waddle");
 const builtin = @import("builtin");
+const wasi_host = @import("wasi_host.zig");
 const parse = waddle.parse;
 const wat = waddle.wat;
 const runtime = waddle.runtime;
 const types = waddle.types;
 const Value = runtime.Value;
+const Runtime = runtime.Runtime;
 
 pub fn main() !void {
     if (builtin.mode == .Debug) {
@@ -57,7 +59,9 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    var host_ctx: ?*anyopaque = null;
+    const preopen_dirs = [_][]const u8{"/home/nathan/code/moonbit/compote"};
+    var host_ctx = try wasi_host.WasiSnapshotPreview1.init(allocator, &preopen_dirs);
+    defer host_ctx.deinit();
     var vm = try createVM(arena.allocator(), wasm_path.?, @ptrCast(&host_ctx));
     defer vm.deinit();
 
@@ -110,6 +114,15 @@ fn run(allocator: std.mem.Allocator) !void {
         if (results.len > 0) {
             std.debug.print("\n", .{});
         }
+    } else {
+        // WASI command modules export _start as their entrypoint. Auto-invoke it
+        // when no explicit --invoke flag was given, just like wasmi/wasmtime do.
+        if (vm.getExportByName("_start")) |_| {
+            _ = try vm.invokeExportedFunc(allocator, "_start", &.{});
+        } else |err| switch (err) {
+            error.ExportNotFound => {}, // not a WASI command module, nothing to do
+            else => return err,
+        }
     }
 }
 
@@ -138,56 +151,7 @@ fn specTestPrintChar(stack: *runtime.ValueStack, _: *runtime.ModuleInstance, _: 
     _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
 }
 
-const WasiSnapshotPreview1Host = struct {
-    const WasiErrNo = enum(u16) {
-        success = 0,
-        badf = 8,
-    };
-
-    fn fd_write(stack: *runtime.ValueStack, mod: *runtime.ModuleInstance, store: *runtime.Store) !void {
-        const mem_inst = &store.mems.items[mod.mem_addrs[0]];
-        const args = stack.staticPopValues(.i32, 4);
-        const fd: u8 = @intCast(args[0]);
-        const iovs_ptr: usize = @intCast(args[1]);
-        const iovs_len: usize = @intCast(args[2]);
-        const nwritten: usize = @intCast(args[3]);
-        var total_bytes_written: usize = 0;
-        const host_fd = switch (fd) {
-            0 => std.posix.STDIN_FILENO,
-            1 => std.posix.STDOUT_FILENO,
-            2 => std.posix.STDERR_FILENO,
-            else => fd,
-        };
-
-        for (0..iovs_len) |i| {
-            const iov_ptr: u32 = @intCast(try mem_inst.read(.i32, iovs_ptr + i * 8 + 0));
-            const iov_len: u32 = @intCast(try mem_inst.read(.i32, iovs_ptr + i * 8 + 4));
-            const bytes = mem_inst.data[iov_ptr .. iov_ptr + iov_len];
-            const bytes_written = try std.posix.write(host_fd, bytes);
-
-            if (bytes_written != iov_len) {
-                break;
-            }
-
-            total_bytes_written += bytes_written;
-        }
-
-        try mem_inst.write(.i32, nwritten, @intCast(total_bytes_written));
-        try stack.push(.i32, @intCast(@intFromEnum(WasiErrNo.success)));
-    }
-
-    fn getImports() [1]runtime.Store.Import {
-        return [_]runtime.Store.Import{
-            .{
-                .module = "wasi_snapshot_preview1",
-                .name = "fd_write",
-                .value = .{ .func = fd_write },
-            },
-        };
-    }
-};
-
-fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_ctx: ?*anyopaque) !runtime.Runtime {
+fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_ctx: ?*anyopaque) !Runtime {
     var store = runtime.Store.init(allocator, host_ctx);
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
@@ -206,7 +170,7 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_ctx: ?*a
         return error.UnsupportedModuleFormat;
     }
 
-    const imports = WasiSnapshotPreview1Host.getImports();
+    const imports = wasi_host.WasiSnapshotPreview1.getImports();
     const module_inst = try store.instantiate(module, &imports);
-    return try runtime.Runtime.init(allocator, store, module_inst);
+    return try Runtime.init(allocator, store, module_inst);
 }

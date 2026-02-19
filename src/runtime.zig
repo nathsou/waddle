@@ -9,7 +9,6 @@ const MemIndex = types.MemIndex;
 const ValType = types.ValType;
 
 const PC = usize;
-
 const FuncRef = ?FuncAddr;
 const ExternRef = ?*anyopaque;
 
@@ -2323,7 +2322,7 @@ const WasmFunc = struct {
     code: types.Func,
 };
 
-pub const HostFuncPtr = *const fn (*ValueStack, *ModuleInstance, *Store) anyerror!void;
+pub const HostFuncPtr = *const fn (*Runtime) anyerror!void;
 
 pub const HostFunc = struct {
     type: types.FuncType,
@@ -2396,13 +2395,17 @@ const MemoryInstance = struct {
     }
 
     pub fn write(self: *MemoryInstance, comptime VT: ValType, offset: usize, val: Value.matchingType(VT)) !void {
-        const byte_offset = offset + @sizeOf(Value.matchingType(VT));
-        if (byte_offset > self.data.len) {
+        const bytes = Value.toBytes(VT, val);
+        try self.writeBytes(offset, &bytes);
+    }
+
+    pub fn writeBytes(self: *MemoryInstance, offset: usize, bytes: []const u8) !void {
+        const end = offset + bytes.len;
+        if (end > self.data.len) {
             return error.MemoryAccessOutOfBounds;
         }
 
-        const bytes = Value.toBytes(VT, val);
-        @memcpy(self.data[offset..byte_offset], &bytes);
+        @memcpy(self.data[offset..end], bytes);
     }
 };
 
@@ -2685,7 +2688,7 @@ pub const Runtime = struct {
             },
             .host => |host_func| {
                 results_count = host_func.type.results.len;
-                try host_func.code(&self.stack, self.module, &self.store);
+                try host_func.code(self);
             },
         }
 
@@ -2926,7 +2929,7 @@ pub const Runtime = struct {
                     const func_type = host_func.type;
                     const expected_stack_size_after = stack_size_before + func_type.results.len - func_type.params.len;
 
-                    try host_func.code(&self.stack, self.module, &self.store);
+                    try host_func.code(self);
 
                     if (builtin.mode == .Debug) {
                         // validate that host func returned the expected number of results and that they are of the expected types
@@ -3865,9 +3868,9 @@ pub const Runtime = struct {
                 },
                 .table_init => |arg| {
                     const args = self.popValues(.i32, 3);
-                    const count: usize = @intCast(args[0]);
-                    const table_src_offset: usize = @intCast(args[1]);
-                    const elem_dst_offset: usize = @intCast(args[2]);
+                    const count: usize = @as(u32, @bitCast(args[0]));
+                    const table_src_offset: usize = @as(u32, @bitCast(args[1]));
+                    const elem_dst_offset: usize = @as(u32, @bitCast(args[2]));
 
                     try self.store.initTable(
                         arg.table_addr,
