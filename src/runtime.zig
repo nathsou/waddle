@@ -109,9 +109,21 @@ const MemArg = struct {
     mem_addr: MemAddr,
 };
 
+const BranchUnwindArg = struct {
+    target_pc: PC,
+    stack_height: usize, // relative to frame.base_ptr: unwind destination before placing results
+    arity: usize, // number of result values to preserve on top
+};
+
+const BranchTableEntry = struct {
+    target_pc: PC,
+    stack_height: usize,
+    arity: usize,
+};
+
+// targets[0..len-1] are indexed entries; targets[len-1] is the default.
 const BranchTableArg = struct {
-    label_pcs: []PC,
-    default_pc: PC,
+    targets: []BranchTableEntry,
 };
 
 pub const FlatInstr = union(enum) {
@@ -120,7 +132,9 @@ pub const FlatInstr = union(enum) {
     nop,
     sentinel,
     br: PC,
+    br_unwind: BranchUnwindArg,
     br_if: PC,
+    br_if_unwind: BranchUnwindArg,
     br_table: BranchTableArg,
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
@@ -352,15 +366,22 @@ pub const FlatInstr = union(enum) {
             .@"unreachable" => try writer.writeAll("unreachable"),
             .nop => try writer.writeAll("nop"),
             .sentinel => try writer.writeAll("placeholder"),
-            .br => |target| try writer.print("br {d}", .{target}),
-            .br_if => |target| try writer.print("br_if {d}", .{target}),
+            .br => |target_pc| try writer.print("br {d}", .{target_pc}),
+            .br_unwind => |arg| try writer.print("br_unwind pc={d} height={d} arity={d}", .{ arg.target_pc, arg.stack_height, arg.arity }),
+            .br_if => |target_pc| try writer.print("br_if {d}", .{target_pc}),
+            .br_if_unwind => |arg| try writer.print("br_if_unwind pc={d} height={d} arity={d}", .{ arg.target_pc, arg.stack_height, arg.arity }),
             .br_table => |arg| {
                 try writer.writeAll("br_table [");
-                for (arg.label_pcs, 0..) |pc_val, i| {
-                    try writer.print("{d}", .{pc_val});
-                    if (i != arg.label_pcs.len - 1) try writer.writeAll(", ");
+                const indexed = if (arg.targets.len > 0) arg.targets[0 .. arg.targets.len - 1] else &[_]BranchTableEntry{};
+                for (indexed, 0..) |entry, i| {
+                    try writer.print("{d}", .{entry.target_pc});
+                    if (i != indexed.len - 1) try writer.writeAll(", ");
                 }
-                try writer.print("] default={d}", .{arg.default_pc});
+                if (arg.targets.len > 0) {
+                    try writer.print("] default={d}", .{arg.targets[arg.targets.len - 1].target_pc});
+                } else {
+                    try writer.writeAll("] (empty)");
+                }
             },
             .@"return" => try writer.print("return", .{}),
             .call => |arg| try writer.print("call pc={d} args={d}", .{ arg.entry_pc, arg.arguments }),
@@ -387,9 +408,7 @@ pub const FlatInstr = union(enum) {
             .super_i64_const_return => |imm| try writer.print("super.i64.const.return {d}", .{imm}),
             .super_f32_const_return => |imm| try writer.print("super.f32.const.return {d}", .{imm}),
             .super_f64_const_return => |imm| try writer.print("super.f64.const.return {d}", .{imm}),
-            .super_duplicate => |count| {
-                try writer.print("super.duplicate {d}", .{count});
-            },
+            .super_duplicate => |count| try writer.print("super.duplicate {d}", .{count}),
 
             // Parametric instructions
             .drop => try writer.writeAll("drop"),
@@ -617,6 +636,8 @@ pub const BlockLabel = struct {
     start: PC,
     end: PC,
     branches_to_patch: ArrayList(BranchToPatch),
+    stack_height: usize, // base height for unwind (relative to frame.base_ptr)
+    arity: usize, // number of result/param values to preserve on branch
 
     fn deinit(self: *BlockLabel, allocator: Allocator) void {
         self.branches_to_patch.deinit(allocator);
@@ -640,7 +661,7 @@ pub const Bytecode = struct {
         for (self.instrs) |instr| {
             switch (instr) {
                 .br_table => |arg| {
-                    allocator.free(arg.label_pcs);
+                    allocator.free(arg.targets);
                 },
                 else => {},
             }
@@ -778,6 +799,8 @@ const BytecodeLowering = struct {
     flat: ArrayList(FlatInstr),
     store: *const Store,
     current_func: ?*const WasmFunc,
+    branch_instr_idx: usize,
+    stack_height: usize, // running value stack depth relative to frame base, for fast/slow branch selection
 
     pub fn init(allocator: Allocator, store: *const Store) !BytecodeLowering {
         if (comptime @sizeOf(FlatInstr) > 32) {
@@ -801,6 +824,8 @@ const BytecodeLowering = struct {
             .flat = .empty,
             .store = store,
             .current_func = null,
+            .branch_instr_idx = 0,
+            .stack_height = 0,
         };
     }
 
@@ -881,15 +906,19 @@ const BytecodeLowering = struct {
                 .br => |*target| {
                     target.* = remap_table.resolve(target.*);
                 },
+                .br_unwind => |*arg| {
+                    arg.target_pc = remap_table.resolve(arg.target_pc);
+                },
                 .br_if => |*target| {
                     target.* = remap_table.resolve(target.*);
                 },
+                .br_if_unwind => |*arg| {
+                    arg.target_pc = remap_table.resolve(arg.target_pc);
+                },
                 .br_table => |*arg| {
-                    for (arg.label_pcs) |*label_pc| {
-                        label_pc.* = remap_table.resolve(label_pc.*);
+                    for (arg.targets) |*entry| {
+                        entry.target_pc = remap_table.resolve(entry.target_pc);
                     }
-
-                    arg.default_pc = remap_table.resolve(arg.default_pc);
                 },
                 .call => |*arg| {
                     arg.entry_pc = remap_table.resolve(arg.entry_pc);
@@ -954,18 +983,20 @@ const BytecodeLowering = struct {
                 .br => |target| if (target < self.flat.items.len) {
                     target_pcs.set(target);
                 },
+                .br_unwind => |arg| if (arg.target_pc < self.flat.items.len) {
+                    target_pcs.set(arg.target_pc);
+                },
                 .br_if => |target| if (target < self.flat.items.len) {
                     target_pcs.set(target);
                 },
+                .br_if_unwind => |arg| if (arg.target_pc < self.flat.items.len) {
+                    target_pcs.set(arg.target_pc);
+                },
                 .br_table => |arg| {
-                    for (arg.label_pcs) |target| {
-                        if (target < self.flat.items.len) {
-                            target_pcs.set(target);
+                    for (arg.targets) |entry| {
+                        if (entry.target_pc < self.flat.items.len) {
+                            target_pcs.set(entry.target_pc);
                         }
-                    }
-
-                    if (arg.default_pc < self.flat.items.len) {
-                        target_pcs.set(arg.default_pc);
                     }
                 },
                 else => {},
@@ -1210,6 +1241,10 @@ const BytecodeLowering = struct {
         self.current_func = func;
         defer self.current_func = null;
 
+        // stack_height tracks the value stack depth relative to frame.base_ptr.
+        // At function entry, params are already on the stack.
+        self.stack_height = func.type.params.len;
+
         // Emit instructions to initialize local variables with default values
         // Note: parameters are already on the stack, pushed by caller
         for (func.code.locals) |local_group| {
@@ -1227,6 +1262,8 @@ const BytecodeLowering = struct {
             if (local_group.count > 1) {
                 try self.emit(.{ .super_duplicate = local_group.count - 1 });
             }
+
+            self.stack_height += local_group.count;
         }
 
         for (func.code.body) |instr| {
@@ -1241,15 +1278,11 @@ const BytecodeLowering = struct {
             switch (entry) {
                 .br_patch => |instr_idx| {
                     switch (self.flat.items[instr_idx]) {
-                        .br => |*pc| {
-                            pc.* = label.end;
-                        },
-                        .br_if => |*pc| {
-                            pc.* = label.end;
-                        },
-                        else => {
-                            return error.InvalidBranchInstructionForPatching;
-                        },
+                        .br => |*target| target.* = label.end,
+                        .br_unwind => |*arg| arg.target_pc = label.end,
+                        .br_if => |*target| target.* = label.end,
+                        .br_if_unwind => |*arg| arg.target_pc = label.end,
+                        else => return error.InvalidBranchInstructionForPatching,
                     }
                 },
                 .br_table_patch => |arg| {
@@ -1257,14 +1290,14 @@ const BytecodeLowering = struct {
                         .br_table => |*table| {
                             switch (arg.label) {
                                 .default => {
-                                    table.default_pc = label.end;
+                                    table.targets[table.targets.len - 1].target_pc = label.end;
                                 },
                                 .index => |label_idx| {
-                                    if (label_idx >= table.label_pcs.len) {
+                                    if (label_idx >= table.targets.len - 1) {
                                         return error.InvalidBranchTableLabelIndexForPatching;
                                     }
 
-                                    table.label_pcs[label_idx] = label.end;
+                                    table.targets[label_idx].target_pc = label.end;
                                 },
                             }
                         },
@@ -1316,7 +1349,107 @@ const BytecodeLowering = struct {
         }
     }
 
+    fn blockArity(self: *BytecodeLowering, block_type: types.BlockType) !usize {
+        return switch (block_type) {
+            .empty => 0,
+            .val_type => 1,
+            .type_index => |idx| blk: {
+                const module = try self.getCurrentModule();
+                if (idx >= module.types.len) return error.InvalidTypeIndex;
+                break :blk module.types[idx].results.len;
+            },
+        };
+    }
+
+    fn blockParams(self: *BytecodeLowering, block_type: types.BlockType) !usize {
+        return switch (block_type) {
+            .empty, .val_type => 0,
+            .type_index => |idx| blk: {
+                const module = try self.getCurrentModule();
+                if (idx >= module.types.len) return error.InvalidTypeIndex;
+                break :blk module.types[idx].params.len;
+            },
+        };
+    }
+
+    /// Net stack height change for non-control instructions (after execution).
+    /// Control instructions (block/loop/if/br/br_table/return) manage stack_height themselves.
+    fn instrStackDelta(self: *BytecodeLowering, instr: types.Instr) !isize {
+        return switch (instr) {
+            // Control — handled explicitly in lowerInstr
+            .@"unreachable", .nop, .block, .loop, .@"if", .br, .br_if, .br_table, .@"return" => 0,
+            // Calls
+            .call => |func_idx| blk: {
+                const module_inst = try self.getCurrentModule();
+                const func_addr = module_inst.func_addrs[func_idx];
+                const func_inst = self.store.funcs.items[func_addr];
+                const ft = func_inst.getType();
+                break :blk @as(isize, @intCast(ft.results.len)) - @as(isize, @intCast(ft.params.len));
+            },
+            .call_indirect => |arg| blk: {
+                const module_inst = try self.getCurrentModule();
+                const ft = module_inst.types[arg.type_idx];
+                // -1 for the table index operand
+                break :blk @as(isize, @intCast(ft.results.len)) - @as(isize, @intCast(ft.params.len)) - 1;
+            },
+            // Parametric
+            .drop => -1,
+            .select => -2, // pop val1, val2, i32 → push val
+            // Variable
+            .local_get => 1,
+            .local_set => -1,
+            .local_tee => 0,
+            .global_get => 1,
+            .global_set => -1,
+            // Memory loads: pop addr → push value
+            .i32_load, .i64_load, .f32_load, .f64_load, .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u => 0, // pop addr, push val = net 0
+            // Memory stores: pop addr + val
+            .i32_store, .i64_store, .f32_store, .f64_store, .i32_store8, .i32_store16, .i64_store8, .i64_store16, .i64_store32 => -2,
+            .memory_size => 1,
+            .memory_grow => 0, // pop pages → push old_size
+            .memory_init => -3,
+            .data_drop => 0,
+            .memory_copy => -3,
+            .memory_fill => -3,
+            // Constants
+            .i32_const, .i64_const, .f32_const, .f64_const => 1,
+            // i32 unary: pop → push
+            .i32_eqz, .i32_clz, .i32_ctz, .i32_popcnt => 0,
+            // i32 binary: pop 2 → push 1
+            .i32_eq, .i32_ne, .i32_lt_s, .i32_lt_u, .i32_gt_s, .i32_gt_u, .i32_le_s, .i32_le_u, .i32_ge_s, .i32_ge_u, .i32_add, .i32_sub, .i32_mul, .i32_div_s, .i32_div_u, .i32_rem_s, .i32_rem_u, .i32_and, .i32_or, .i32_xor, .i32_shl, .i32_shr_s, .i32_shr_u, .i32_rotl, .i32_rotr => -1,
+            // i64 unary
+            .i64_eqz => 0,
+            .i64_clz, .i64_ctz, .i64_popcnt => 0,
+            // i64 binary
+            .i64_eq, .i64_ne, .i64_lt_s, .i64_lt_u, .i64_gt_s, .i64_gt_u, .i64_le_s, .i64_le_u, .i64_ge_s, .i64_ge_u, .i64_add, .i64_sub, .i64_mul, .i64_div_s, .i64_div_u, .i64_rem_s, .i64_rem_u, .i64_and, .i64_or, .i64_xor, .i64_shl, .i64_shr_s, .i64_shr_u, .i64_rotl, .i64_rotr => -1,
+            // f32 unary
+            .f32_abs, .f32_neg, .f32_ceil, .f32_floor, .f32_trunc, .f32_nearest, .f32_sqrt => 0,
+            // f32 binary
+            .f32_eq, .f32_ne, .f32_lt, .f32_gt, .f32_le, .f32_ge, .f32_add, .f32_sub, .f32_mul, .f32_div, .f32_min, .f32_max, .f32_copysign => -1,
+            // f64 unary
+            .f64_abs, .f64_neg, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest, .f64_sqrt => 0,
+            // f64 binary
+            .f64_eq, .f64_ne, .f64_lt, .f64_gt, .f64_le, .f64_ge, .f64_add, .f64_sub, .f64_mul, .f64_div, .f64_min, .f64_max, .f64_copysign => -1,
+            // Conversions: all pop 1 → push 1
+            .i32_wrap_i64, .i32_trunc_f32_s, .i32_trunc_f32_u, .i32_trunc_f64_s, .i32_trunc_f64_u, .i64_extend_i32_s, .i64_extend_i32_u, .i64_trunc_f32_s, .i64_trunc_f32_u, .i64_trunc_f64_s, .i64_trunc_f64_u, .f32_convert_i32_s, .f32_convert_i32_u, .f32_convert_i64_s, .f32_convert_i64_u, .f32_demote_f64, .f64_convert_i32_s, .f64_convert_i32_u, .f64_convert_i64_s, .f64_convert_i64_u, .f64_promote_f32, .i32_reinterpret_f32, .i64_reinterpret_f64, .f32_reinterpret_i32, .f64_reinterpret_i64, .i32_extend8_s, .i32_extend16_s, .i64_extend8_s, .i64_extend16_s, .i64_extend32_s, .i32_trunc_sat_f32_s, .i32_trunc_sat_f32_u, .i32_trunc_sat_f64_s, .i32_trunc_sat_f64_u, .i64_trunc_sat_f32_s, .i64_trunc_sat_f32_u, .i64_trunc_sat_f64_s, .i64_trunc_sat_f64_u => 0,
+            // Reference
+            .ref_null => 1,
+            .ref_is_null => 0, // pop ref → push i32
+            .ref_func => 1,
+            // Table
+            .table_get => 0, // pop idx → push ref
+            .table_set => -2,
+            .table_init => -3,
+            .elem_drop => 0,
+            .table_copy => -3,
+            .table_grow => -1, // pop (ref, n) → push old_size
+            .table_size => 1,
+            .table_fill => -3,
+        };
+    }
+
     fn lowerInstr(self: *BytecodeLowering, instr: types.Instr) !void {
+        const delta = try self.instrStackDelta(instr);
         switch (instr) {
             .@"unreachable" => try self.emit(.@"unreachable"),
             .nop => try self.emit(.nop),
@@ -1327,11 +1460,22 @@ const BytecodeLowering = struct {
                     else => unreachable,
                 };
 
+                const num_params = try self.blockParams(block.block_type);
+                const num_results = try self.blockArity(block.block_type);
+                // For block: label arity = results (branch exits block with results).
+                // For loop:  label arity = params (branch re-enters loop with params).
+                const label_arity = if (label_kind == .loop) num_params else num_results;
+                // stack_height at label entry: params are already on stack, subtract them
+                // to get the base height the label targets
+                const label_height = self.stack_height - num_params;
+
                 try self.block_labels.append(self.allocator, BlockLabel{
                     .kind = label_kind,
                     .start = self.flat.items.len,
                     .end = 0, // To be patched
                     .branches_to_patch = .empty,
+                    .stack_height = label_height,
+                    .arity = label_arity,
                 });
 
                 const label_idx = self.block_labels.items.len - 1;
@@ -1348,34 +1492,60 @@ const BytecodeLowering = struct {
 
                 self.block_labels.items[label_idx].deinit(self.allocator);
                 self.block_labels.items.len -= 1; // Pop the label
+
+                // After block: stack has base + results
+                self.stack_height = label_height + num_results;
             },
             .@"if" => |if_| {
+                const num_params = try self.blockParams(if_.block_type);
+                const num_results = try self.blockArity(if_.block_type);
+                const label_height = self.stack_height - num_params - 1; // -1 for the i32 condition
+
                 try self.block_labels.append(self.allocator, BlockLabel{
                     .kind = .@"if",
                     .start = self.flat.items.len,
                     .end = 0, // To be patched
                     .branches_to_patch = .empty,
+                    .stack_height = label_height,
+                    .arity = num_results,
                 });
 
                 const exit_label_idx = self.block_labels.items.len - 1;
 
-                // negate condition to skip then block if false
+                // negate condition to skip then block if false (i32_eqz has net zero stack effect)
                 try self.emit(.i32_eqz);
                 const else_jump_idx = self.flat.items.len;
+                // Fast-path br_if to else: br_if pops the negated condition (net -1 to stack)
                 try self.emit(.{ .br_if = 0 }); // Placeholder for branch to else block
+                self.stack_height -= 1; // br_if consumes the condition
+
+                // Restore params onto stack for then body
+                self.stack_height += num_params;
 
                 for (if_.then_instructions) |then_instr| {
                     try self.lowerInstr(then_instr);
                 }
 
-                // Unconditionally jump to end of if after then block
-                try self.block_labels.items[exit_label_idx].branches_to_patch.append(self.allocator, BranchToPatch{
-                    .br_patch = self.flat.items.len,
-                });
-
-                try self.emit(.{ .br = 0 });
+                // Unconditionally jump to end of if after then block.
+                // Emit fast or slow variant based on whether the stack height matches.
+                {
+                    const then_stack_height = self.stack_height;
+                    const expected_height = label_height + num_results;
+                    const patch_idx = self.flat.items.len;
+                    try self.block_labels.items[exit_label_idx].branches_to_patch.append(self.allocator, BranchToPatch{
+                        .br_patch = patch_idx,
+                    });
+                    if (then_stack_height == expected_height) {
+                        try self.emit(.{ .br = 0 });
+                    } else {
+                        try self.emit(.{ .br_unwind = .{ .target_pc = 0, .stack_height = label_height, .arity = num_results } });
+                    }
+                }
 
                 self.flat.items[else_jump_idx] = .{ .br_if = self.flat.items.len }; // Patch branch to else block
+
+                // Reset stack for else branch: label_height + params
+                self.stack_height = label_height + num_params;
 
                 for (if_.else_instructions) |else_instr| {
                     try self.lowerInstr(else_instr);
@@ -1386,6 +1556,8 @@ const BytecodeLowering = struct {
                 try self.patchBranches(exit_label);
                 exit_label.deinit(self.allocator);
                 self.block_labels.items.len -= 1; // Pop the label
+
+                self.stack_height = label_height + num_results;
             },
             .br, .br_if => |label_idx| {
                 if (self.block_labels.items.len <= label_idx) {
@@ -1393,15 +1565,31 @@ const BytecodeLowering = struct {
                 }
 
                 const label = &self.block_labels.items[self.block_labels.items.len - 1 - label_idx];
+                // Determine whether unwinding is needed:
+                // For br_if, the condition is consumed before branching, so we subtract 1
+                // for the condition that br_if pops before deciding.
+                const cur_height = switch (instr) {
+                    .br_if => self.stack_height - 1, // br_if pops the condition first
+                    else => self.stack_height,
+                };
+                const needs_unwind = cur_height != label.stack_height + label.arity;
 
                 switch (label.kind) {
                     .loop => {
-                        // Branch to the start of the loop
-                        try self.emit(switch (instr) {
-                            .br => .{ .br = label.start },
-                            .br_if => .{ .br_if = label.start },
-                            else => unreachable,
-                        });
+                        // Branch to the start of the loop (target is known, no patching needed)
+                        if (needs_unwind) {
+                            try self.emit(switch (instr) {
+                                .br => .{ .br_unwind = .{ .target_pc = label.start, .stack_height = label.stack_height, .arity = label.arity } },
+                                .br_if => .{ .br_if_unwind = .{ .target_pc = label.start, .stack_height = label.stack_height, .arity = label.arity } },
+                                else => unreachable,
+                            });
+                        } else {
+                            try self.emit(switch (instr) {
+                                .br => .{ .br = label.start },
+                                .br_if => .{ .br_if = label.start },
+                                else => unreachable,
+                            });
+                        }
                     },
                     .block, .@"if" => {
                         // Emit a placeholder branch instruction and record it for patching
@@ -1410,22 +1598,38 @@ const BytecodeLowering = struct {
                             .br_patch = patch_idx,
                         });
 
-                        try self.emit(switch (instr) {
-                            .br => .{ .br = 0 },
-                            .br_if => .{ .br_if = 0 },
-                            else => unreachable,
-                        });
+                        if (needs_unwind) {
+                            try self.emit(switch (instr) {
+                                .br => .{ .br_unwind = .{ .target_pc = 0, .stack_height = label.stack_height, .arity = label.arity } },
+                                .br_if => .{ .br_if_unwind = .{ .target_pc = 0, .stack_height = label.stack_height, .arity = label.arity } },
+                                else => unreachable,
+                            });
+                        } else {
+                            try self.emit(switch (instr) {
+                                .br => .{ .br = 0 },
+                                .br_if => .{ .br_if = 0 },
+                                else => unreachable,
+                            });
+                        }
                     },
                 }
             },
             .br_table => |arg| {
-                const label_pcs = try self.allocator.alloc(PC, arg.label_indices.len);
-                errdefer self.allocator.free(label_pcs);
+                // Allocate label_indices.len + 1; the last entry is the default.
+                const targets = try self.allocator.alloc(BranchTableEntry, arg.label_indices.len + 1);
+                errdefer self.allocator.free(targets);
                 const instr_idx = self.flat.items.len;
+                // br_table pops the selector i32, so effective stack height is self.stack_height - 1
+                const cur_height = self.stack_height - 1;
 
-                for (label_pcs, 0..) |*pc, i| {
+                for (targets[0..arg.label_indices.len], 0..) |*entry, i| {
                     const label_idx = arg.label_indices[i];
-                    try self.registerBranchPatch(pc, label_idx, BranchToPatch{
+                    if (self.block_labels.items.len <= label_idx) return error.InvalidLabelIndex;
+                    const lbl = &self.block_labels.items[self.block_labels.items.len - 1 - label_idx];
+                    entry.stack_height = lbl.stack_height;
+                    entry.arity = lbl.arity;
+                    _ = cur_height; // already embedded in entry
+                    try self.registerBranchPatch(&entry.target_pc, label_idx, BranchToPatch{
                         .br_table_patch = .{
                             .instr_idx = instr_idx,
                             .label = .{ .index = i },
@@ -1433,19 +1637,21 @@ const BytecodeLowering = struct {
                     });
                 }
 
-                var br_table_arg = BranchTableArg{
-                    .label_pcs = label_pcs,
-                    .default_pc = 0, // To be patched
-                };
+                // Default entry is last.
+                {
+                    const label_idx = arg.default_idx;
+                    if (self.block_labels.items.len <= label_idx) return error.InvalidLabelIndex;
+                    const lbl = &self.block_labels.items[self.block_labels.items.len - 1 - label_idx];
+                    targets[targets.len - 1] = .{ .target_pc = 0, .stack_height = lbl.stack_height, .arity = lbl.arity };
+                    try self.registerBranchPatch(&targets[targets.len - 1].target_pc, label_idx, BranchToPatch{
+                        .br_table_patch = .{
+                            .instr_idx = instr_idx,
+                            .label = .default,
+                        },
+                    });
+                }
 
-                try self.registerBranchPatch(&br_table_arg.default_pc, arg.default_idx, BranchToPatch{
-                    .br_table_patch = .{
-                        .instr_idx = instr_idx,
-                        .label = .default,
-                    },
-                });
-
-                try self.emit(.{ .br_table = .{ .label_pcs = label_pcs, .default_pc = 0 } });
+                try self.emit(.{ .br_table = .{ .targets = targets } });
             },
             .call => |func_idx| {
                 const call_instr_idx = self.flat.items.len;
@@ -1736,6 +1942,14 @@ const BytecodeLowering = struct {
                 try self.emit(.{ .table_fill = table_addr });
             },
         }
+        // Apply net stack height change for non-control instructions.
+        // Control instructions (block/loop/if/br/br_if/br_table/return) already
+        // update self.stack_height directly and have delta == 0.
+        if (delta > 0) {
+            self.stack_height += @intCast(delta);
+        } else if (delta < 0) {
+            self.stack_height -= @intCast(-delta);
+        }
     }
 };
 
@@ -1840,7 +2054,6 @@ pub const Store = struct {
         };
 
         errdefer module_inst.deinit(self.allocator);
-
         const func_base = self.funcs.items.len;
         const table_base = self.tables.items.len;
         const mem_base = self.mems.items.len;
@@ -2127,9 +2340,10 @@ pub const Store = struct {
         elem_dst_offset: usize,
         count: usize,
     ) !void {
+        if (count == 0) return;
         const table_inst = &self.tables.items[table_addr];
         const values = self.elems.items[elem_addr].refs;
-        if (table_src_offset + count > table_inst.elem.len or elem_dst_offset + count > table_inst.elem.len or table_src_offset + count > values.len) {
+        if (table_src_offset + count > table_inst.elem.len or elem_dst_offset + count > values.len) {
             return error.TableInitOutOfBounds;
         }
 
@@ -2140,8 +2354,6 @@ pub const Store = struct {
     }
 
     pub fn instantiate(self: *Store, module: types.Module, imports: []const Import) !*ModuleInstance {
-        // TODO: Validate the module
-
         const num_global_imports = blk: {
             var count: usize = 0;
             for (module.imports) |import| {
@@ -2425,6 +2637,19 @@ const ExportInstance = struct {
 
 const ElemInstance = struct {
     refs: []u64, // encoded FuncRef or ExternRef
+
+    fn init(allocator: Allocator, length: usize) !ElemInstance {
+        const refs = try allocator.alloc(u64, length);
+        @memset(refs, Value.NullRefSentinel);
+
+        return ElemInstance{
+            .refs = refs,
+        };
+    }
+
+    fn deinit(self: *ElemInstance, allocator: Allocator) void {
+        allocator.free(self.refs);
+    }
 };
 
 pub const ExternVal = union(enum) {
@@ -2858,6 +3083,26 @@ pub const Runtime = struct {
         return std.math.clamp(@as(Dst, @intFromFloat(val)), std.math.minInt(Dst), std.math.maxInt(Dst));
     }
 
+    /// Unwind the value stack using pre-computed unwind info,
+    /// preserving `arg.arity` result values on top, then jump to `arg.target_pc`.
+    fn branchToUnwind(self: *Runtime, pc: *PC, arg: BranchUnwindArg) !void {
+        const frame = try self.getCurrentFrame();
+        const abs_height = frame.base_ptr + arg.stack_height;
+        if (arg.arity > 0) {
+            const src_start = self.stack.top - arg.arity;
+            @memmove(
+                self.stack.values[abs_height .. abs_height + arg.arity],
+                self.stack.values[src_start..self.stack.top],
+            );
+            @memmove(
+                self.stack.types[abs_height .. abs_height + arg.arity],
+                self.stack.types[src_start..self.stack.top],
+            );
+        }
+        self.stack.top = abs_height + arg.arity;
+        pc.* = arg.target_pc;
+    }
+
     pub fn execute(self: *Runtime, start_pc: usize) !void {
         var pc = start_pc;
 
@@ -2874,21 +3119,27 @@ pub const Runtime = struct {
                 .br => |target_pc| {
                     pc = target_pc;
                 },
+                .br_unwind => |arg| {
+                    try self.branchToUnwind(&pc, arg);
+                },
                 .br_if => |target_pc| {
                     const condition = self.pop(.i32);
-
                     if (condition != 0) {
                         pc = target_pc;
                     }
                 },
+                .br_if_unwind => |arg| {
+                    const condition = self.pop(.i32);
+                    if (condition != 0) {
+                        try self.branchToUnwind(&pc, arg);
+                    }
+                },
                 .br_table => |table| {
                     const i: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
-
-                    if (i < table.label_pcs.len) {
-                        pc = table.label_pcs[i];
-                    } else {
-                        pc = table.default_pc;
-                    }
+                    // Last entry is the default; indexed entries are [0..len-2]
+                    const indexed_len = if (table.targets.len > 0) table.targets.len - 1 else 0;
+                    const entry = if (i < indexed_len) table.targets[i] else table.targets[table.targets.len - 1];
+                    try self.branchToUnwind(&pc, .{ .target_pc = entry.target_pc, .stack_height = entry.stack_height, .arity = entry.arity });
                 },
                 .@"return" => |arity| {
                     const frame = try self.getCurrentFrame();
@@ -2973,16 +3224,16 @@ pub const Runtime = struct {
                         return error.UninitializedTableElement;
                     }
                 },
-                .super_i32_eqz_br_if => |target_pc| {
+                .super_i32_eqz_br_if => |target| {
                     const condition = self.pop(.i32);
                     if (condition == 0) {
-                        pc = target_pc;
+                        pc = target;
                     }
                 },
-                .super_i32_eq_br_if => |target_pc| {
+                .super_i32_eq_br_if => |target| {
                     const args = self.popValues(.i32, 2);
                     if (args[0] == args[1]) {
-                        pc = target_pc;
+                        pc = target;
                     }
                 },
                 .super_local_get_local_get => |arg| {
@@ -3397,8 +3648,18 @@ pub const Runtime = struct {
                         }
                     }
                 },
-                .memory_fill => |_| {
-                    return error.MemoryFillNotImplemented;
+                .memory_fill => |mem_addr| {
+                    // Stack (bottom to top): d (dest), val (byte), n (count)
+                    const n: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
+                    const val: u8 = @truncate(@as(u32, @bitCast(self.pop(.i32))));
+                    const d: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
+                    const mem_inst = &self.store.mems.items[mem_addr];
+                    if (n != 0) {
+                        if (d + n > mem_inst.data.len) {
+                            return error.MemoryFillOutOfBounds;
+                        }
+                        @memset(mem_inst.data[d .. d + n], val);
+                    }
                 },
                 .i64_eqz => {
                     const val = self.pop(.i64);
@@ -3842,7 +4103,7 @@ pub const Runtime = struct {
                 },
                 .table_get => |table_idx| {
                     const table_inst = &self.store.tables.items[table_idx];
-                    const elem_idx: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
+                    const elem_idx: usize = @as(u32, @bitCast(self.pop(.i32)));
 
                     if (elem_idx >= table_inst.elem.len) {
                         return error.TableGetOutOfBounds;
@@ -3854,7 +4115,7 @@ pub const Runtime = struct {
                 .table_set => |table_idx| {
                     const table_inst = &self.store.tables.items[table_idx];
                     const ref = self.popValue();
-                    const elem_idx: usize = @intCast(@as(u32, @bitCast(self.pop(.i32))));
+                    const elem_idx: usize = @as(u32, @bitCast(self.pop(.i32)));
 
                     if (elem_idx >= table_inst.elem.len) {
                         return error.TableSetOutOfBounds;
@@ -3864,32 +4125,68 @@ pub const Runtime = struct {
                 },
                 .table_init => |arg| {
                     const args = self.popValues(.i32, 3);
-                    const count: usize = @as(u32, @bitCast(args[0]));
-                    const table_src_offset: usize = @as(u32, @bitCast(args[1]));
-                    const elem_dst_offset: usize = @as(u32, @bitCast(args[2]));
-
-                    try self.store.initTable(
-                        arg.table_addr,
-                        arg.elem_addr,
-                        table_src_offset,
-                        elem_dst_offset,
-                        count,
-                    );
+                    const dst: usize = @as(u32, @bitCast(args[0]));
+                    const src: usize = @as(u32, @bitCast(args[1]));
+                    const count: usize = @as(u32, @bitCast(args[2]));
+                    try self.store.initTable(arg.table_addr, arg.elem_addr, dst, src, count);
                 },
-                .elem_drop => {
-                    return error.ElemDropNotImplemented;
+                .elem_drop => |elem_addr| {
+                    var elem_inst = &self.store.elems.items[elem_addr];
+                    elem_inst.deinit(self.allocator);
                 },
-                .table_copy => {
-                    return error.TableCopyNotImplemented;
+                .table_copy => |arg| {
+                    const count: usize = @as(u32, @bitCast(self.pop(.i32)));
+                    const src: usize = @as(u32, @bitCast(self.pop(.i32)));
+                    const dst: usize = @as(u32, @bitCast(self.pop(.i32)));
+                    if (count != 0) {
+                        if (arg.src_table_addr == arg.dst_table_addr) {
+                            const table_inst = &self.store.tables.items[arg.dst_table_addr];
+                            if (src + count > table_inst.elem.len or dst + count > table_inst.elem.len) {
+                                return error.TableCopyOutOfBounds;
+                            }
+                            @memmove(table_inst.elem[dst .. dst + count], table_inst.elem[src .. src + count]);
+                        } else {
+                            const src_table = &self.store.tables.items[arg.src_table_addr];
+                            const dst_table = &self.store.tables.items[arg.dst_table_addr];
+                            if (src + count > src_table.elem.len or dst + count > dst_table.elem.len) {
+                                return error.TableCopyOutOfBounds;
+                            }
+                            @memcpy(dst_table.elem[dst .. dst + count], src_table.elem[src .. src + count]);
+                        }
+                    }
                 },
-                .table_grow => {
-                    return error.TableGrowNotImplemented;
+                .table_grow => |table_addr| {
+                    const n: u32 = @bitCast(self.pop(.i32));
+                    const val = self.popValue();
+                    const table_inst = &self.store.tables.items[table_addr];
+                    const old_len = table_inst.elem.len;
+                    const new_len = old_len + n;
+                    const result: i32 = grow: {
+                        if (table_inst.max) |max| {
+                            if (new_len > max) break :grow -1;
+                        }
+                        const new_elem = self.store.allocator.realloc(table_inst.elem, new_len) catch break :grow -1;
+                        @memset(new_elem[old_len..], val.encode());
+                        table_inst.elem = new_elem;
+                        break :grow @bitCast(@as(u32, @truncate(old_len)));
+                    };
+                    try self.push(.i32, result);
                 },
-                .table_size => {
-                    return error.TableSizeNotImplemented;
+                .table_size => |table_addr| {
+                    const table_inst = &self.store.tables.items[table_addr];
+                    try self.push(.i32, @bitCast(@as(u32, @truncate(table_inst.elem.len))));
                 },
-                .table_fill => {
-                    return error.TableFillNotImplemented;
+                .table_fill => |table_addr| {
+                    const n: usize = @as(u32, @bitCast(self.pop(.i32)));
+                    const val = self.popValue();
+                    const dst: usize = @as(u32, @bitCast(self.pop(.i32)));
+                    const table_inst = &self.store.tables.items[table_addr];
+                    if (n != 0) {
+                        if (dst + n > table_inst.elem.len) {
+                            return error.TableFillOutOfBounds;
+                        }
+                        @memset(table_inst.elem[dst .. dst + n], val.encode());
+                    }
                 },
             }
         }
