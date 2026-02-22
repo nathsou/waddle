@@ -76,8 +76,6 @@ fn run(allocator: std.mem.Allocator) !void {
     defer arena_alloc.free(full_vm_args);
     full_vm_args[0] = wasm_path.?;
     @memcpy(full_vm_args[1..], vm_args);
-    std.debug.print("[main] wasm_path={s} vm_args.len={d} full_vm_args.len={d}\n", .{ wasm_path.?, vm_args.len, full_vm_args.len });
-    for (full_vm_args, 0..) |a, idx| std.debug.print("[main]   full_vm_args[{d}]='{s}'\n", .{ idx, a });
     var host_ctx = try wasi_host.WasiSnapshotPreview1.init(allocator, preopen_dirs.items, full_vm_args, &.{});
     defer host_ctx.deinit();
     var vm = try createVM(arena_alloc, wasm_path.?, @ptrCast(&host_ctx));

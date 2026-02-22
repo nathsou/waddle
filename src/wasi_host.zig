@@ -286,7 +286,7 @@ pub const WasiSnapshotPreview1 = struct {
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         // sig: (fd i32, offset i64, whence i32, newoffset_ptr i32) -> i32
         const new_offset_ptr: usize = @intCast(try vm.stack.pop(.i32));
-        const whence: usize = @intCast(try vm.stack.pop(.i32));
+        const whence: c_int = @intCast(try vm.stack.pop(.i32));
         const offset: i64 = try vm.stack.pop(.i64);
         const wasi_fd: i32 = try vm.stack.pop(.i32);
         var errno: ErrNo = undefined;
@@ -418,9 +418,9 @@ pub const WasiSnapshotPreview1 = struct {
             filestat_bytes[16] = posixModeToWasiFiletype(stat.mode);
             std.mem.writeInt(u64, filestat_bytes[24..32], @as(u64, @intCast(stat.nlink)), .little);
             std.mem.writeInt(u64, filestat_bytes[32..40], @as(u64, @bitCast(@as(i64, stat.size))), .little);
-            const atim_ns = timespecToNs(stat.atim);
-            const mtim_ns = timespecToNs(stat.mtim);
-            const ctim_ns = timespecToNs(stat.ctim);
+            const atim_ns = timespecToNs(stat.atime());
+            const mtim_ns = timespecToNs(stat.mtime());
+            const ctim_ns = timespecToNs(stat.ctime());
             std.mem.writeInt(u64, filestat_bytes[40..48], atim_ns, .little);
             std.mem.writeInt(u64, filestat_bytes[48..56], mtim_ns, .little);
             std.mem.writeInt(u64, filestat_bytes[56..64], ctim_ns, .little);
