@@ -3,17 +3,8 @@ const types = @import("types.zig");
 
 /// Parser for WASM binary format (Core 1.0).
 ///
-/// This parser allocates memory for parsed structures and does not provide
-/// individual deinit functions. It is designed to work with an ArenaAllocator
-/// for simple cleanup of all parsed data at once.
-///
-/// Example usage:
-///     var arena = std.heap.ArenaAllocator.init(gpa);
-///     defer arena.deinit();
-///
-///     var parser = Parser.init(arena.allocator(), wasm_bytes);
-///     const module = try parser.parseModule();
-///     // All allocations are freed when arena.deinit() is called
+/// The returned `types.Module` owns all allocated memory, including the input
+/// `wasm_bytes` slice. Call `module.deinit(allocator)` to free everything.
 pub const Parser = struct {
     bytes: []const u8,
     index: usize = 0,
@@ -1005,6 +996,7 @@ pub const Parser = struct {
         }
 
         return types.Module{
+            .bytes = self.bytes,
             .custom = try custom_sections.toOwnedSlice(self.allocator),
             .types = types_,
             .imports = imports,

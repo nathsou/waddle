@@ -119,7 +119,8 @@ pub const WasiSnapshotPreview1 = struct {
         return null;
     }
 
-    fn argsSizesGet(vm: *Runtime) !void {
+    fn argsSizesGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -136,7 +137,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, .success);
     }
 
-    fn argsGet(vm: *Runtime) !void {
+    fn argsGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -158,7 +160,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, .success);
     }
 
-    fn environSizesGet(vm: *Runtime) !void {
+    fn environSizesGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -175,7 +178,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, .success);
     }
 
-    fn environGet(vm: *Runtime) !void {
+    fn environGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -198,7 +202,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, .success);
     }
 
-    fn fdRead(vm: *Runtime) !void {
+    fn fdRead(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 4);
@@ -248,7 +253,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdWrite(vm: *Runtime) !void {
+    fn fdWrite(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 4);
@@ -281,18 +287,19 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdSeek(vm: *Runtime) !void {
+    fn fdSeek(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         // sig: (fd i32, offset i64, whence i32, newoffset_ptr i32) -> i32
         const new_offset_ptr: usize = @intCast(try vm.stack.pop(.i32));
-        const whence: c_int = @intCast(try vm.stack.pop(.i32));
+        const whence: i32 = try vm.stack.pop(.i32);
         const offset: i64 = try vm.stack.pop(.i64);
         const wasi_fd: i32 = try vm.stack.pop(.i32);
         var errno: ErrNo = undefined;
 
         if (ctx.wasiFdToHostFd(wasi_fd)) |host_fd| {
-            const new_offset = std.posix.system.lseek(host_fd, offset, whence);
+            const new_offset = std.posix.system.lseek(host_fd, offset, @intCast(whence));
             try mem_inst.write(.i64, new_offset_ptr, @intCast(new_offset));
             errno = .success;
         } else {
@@ -302,7 +309,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdStatGet(vm: *Runtime) !void {
+    fn fdStatGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -327,7 +335,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdFdstatGet(vm: *Runtime) !void {
+    fn fdFdstatGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -359,7 +368,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdFdstatSetFlags(vm: *Runtime) !void {
+    fn fdFdstatSetFlags(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const args = vm.stack.staticPopValues(.i32, 2);
         const wasi_fd: i32 = args[0];
@@ -383,7 +393,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn pathFilestatGet(vm: *Runtime) !void {
+    fn pathFilestatGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 5);
@@ -433,7 +444,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdPrestatGet(vm: *Runtime) !void {
+    fn fdPrestatGet(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 2);
@@ -455,7 +467,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdPrestatDirName(vm: *Runtime) !void {
+    fn fdPrestatDirName(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
         const args = vm.stack.staticPopValues(.i32, 3);
@@ -480,7 +493,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn pathOpen(vm: *Runtime) !void {
+    fn pathOpen(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const opened_fd_ptr: usize = @intCast(try vm.stack.pop(.i32));
         const fdflags: FdFlags = @bitCast(@as(u16, @intCast(try vm.stack.pop(.i32))));
@@ -528,7 +542,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn fdClose(vm: *Runtime) !void {
+    fn fdClose(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const ctx = try vm.store.getContext(WasiSnapshotPreview1);
         const wasi_fd: i32 = try vm.stack.pop(.i32);
         var errno: ErrNo = undefined;
@@ -543,7 +558,8 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
-    fn procExit(vm: *Runtime) !void {
+    fn procExit(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const exit_code: u8 = @intCast(try vm.stack.pop(.i32));
         std.posix.exit(exit_code);
     }

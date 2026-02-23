@@ -421,6 +421,8 @@ pub const CodeSection = []Code;
 pub const DataSection = []Data;
 
 pub const Module = struct {
+    /// Raw WASM bytes. Names and other string-like fields are slices into this.
+    bytes: []const u8,
     custom: []CustomSection,
     types: TypeSection,
     imports: ImportSection,
@@ -433,4 +435,70 @@ pub const Module = struct {
     elements: ElementSection,
     codes: CodeSection,
     data: DataSection,
+
+    pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.custom);
+
+        for (self.types) |*ft| ft.deinit(allocator);
+        allocator.free(self.types);
+
+        allocator.free(self.imports);
+        allocator.free(self.functions);
+        allocator.free(self.tables);
+        allocator.free(self.memories);
+
+        for (self.globals) |global| freeExpr(allocator, global.init);
+        allocator.free(self.globals);
+
+        allocator.free(self.exports);
+
+        for (self.elements) |elem| {
+            switch (elem.mode) {
+                .active => |mode| freeExpr(allocator, mode.offset),
+                .passive, .declarative => {},
+            }
+            switch (elem.init) {
+                .func_indices => |s| allocator.free(s),
+                .exprs => |exprs| {
+                    for (exprs) |expr| freeExpr(allocator, expr);
+                    allocator.free(exprs);
+                },
+            }
+        }
+        allocator.free(self.elements);
+
+        for (self.codes) |code| {
+            allocator.free(code.locals);
+            freeExpr(allocator, code.body);
+        }
+        allocator.free(self.codes);
+
+        for (self.data) |d| {
+            allocator.free(d.init);
+            switch (d.mode) {
+                .active => |mode| freeExpr(allocator, mode.offset),
+                .passive => {},
+            }
+        }
+        allocator.free(self.data);
+    }
+
+    fn freeExpr(allocator: std.mem.Allocator, expr: Expr) void {
+        for (expr) |instr| freeInstr(allocator, instr);
+        allocator.free(expr);
+    }
+
+    fn freeInstr(allocator: std.mem.Allocator, instr: Instr) void {
+        switch (instr) {
+            .block => |b| freeExpr(allocator, b.instructions),
+            .loop => |b| freeExpr(allocator, b.instructions),
+            .@"if" => |i| {
+                freeExpr(allocator, i.then_instructions);
+                freeExpr(allocator, i.else_instructions);
+            },
+            .br_table => |bt| allocator.free(bt.label_indices),
+            else => {},
+        }
+    }
 };

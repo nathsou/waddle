@@ -5,6 +5,7 @@ WASM core 1.0 Virtual Machine in Zig
 ## Features
 
 - [x] Binary format (.wasm) parser
+- [x] WAT file support (using bundled `wat2wasm` tool) 
 - [x] Bytecode interpreter
 
 ## Extensions

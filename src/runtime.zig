@@ -1985,6 +1985,20 @@ pub const Store = struct {
             self.allocator.free(mem.data);
         }
 
+        for (self.elems.items) |*elem| {
+            elem.deinit(self.allocator);
+        }
+
+        for (self.funcs.items) |func| {
+            switch (func) {
+                .host => |hf| {
+                    self.allocator.free(hf.type.params);
+                    self.allocator.free(hf.type.results);
+                },
+                .wasm => {},
+            }
+        }
+
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.mems.deinit(self.allocator);
@@ -2040,8 +2054,23 @@ pub const Store = struct {
         const module_inst = try allocator.create(ModuleInstance);
         errdefer allocator.destroy(module_inst);
 
+        // Deep-copy the type section so the module's parsed memory can be freed
+        // after instantiation. FuncType params/results are referenced at runtime
+        // (call_indirect checks, invokeFunc, etc.) so they must outlive the module.
+        const types_copy = try allocator.alloc(types.FuncType, module.types.len);
+        errdefer {
+            for (types_copy) |*ft| ft.deinit(allocator);
+            allocator.free(types_copy);
+        }
+        for (module.types, 0..) |ft, i| {
+            const params = try allocator.dupe(types.ValType, ft.params);
+            errdefer allocator.free(params);
+            const results = try allocator.dupe(types.ValType, ft.results);
+            types_copy[i] = .{ .params = params, .results = results };
+        }
+
         module_inst.* = ModuleInstance{
-            .types = module.types,
+            .types = types_copy,
             .func_addrs = func_addrs,
             .table_addrs = table_addrs,
             .mem_addrs = mem_addrs,
@@ -2111,13 +2140,14 @@ pub const Store = struct {
         var local_func_idx: usize = 0;
         for (module.functions, 0..) |type_idx, i| {
             const type_idx_usize = @as(usize, type_idx);
-            if (type_idx_usize >= module.types.len) {
+            if (type_idx_usize >= module_inst.types.len) {
                 return error.InvalidTypeIndex;
             }
 
             const func_inst = FuncInstance{
                 .wasm = .{
-                    .type = module.types[type_idx_usize],
+                    // Use the copied types so WasmFunc.type survives module.deinit().
+                    .type = module_inst.types[type_idx_usize],
                     .module = module_inst,
                     .code = module.codes[i],
                 },
@@ -2223,60 +2253,49 @@ pub const Store = struct {
             try self.elems.append(self.allocator, elem_inst);
         }
 
-        // Build exports
+        // Build exports, copying names so they survive module.deinit().
         for (module.exports, 0..) |exp, i| {
-            switch (exp.desc) {
-                .func => |func_idx| {
+            const name = try allocator.dupe(u8, exp.name);
+            errdefer allocator.free(name);
+
+            const value: ExternVal = switch (exp.desc) {
+                .func => |func_idx| blk: {
                     const func_idx_usize = @as(usize, func_idx);
                     if (func_idx_usize >= module_inst.func_addrs.len) {
                         return error.InvalidFuncIndex;
                     }
-                    const func_addr = module_inst.func_addrs[func_idx_usize];
-                    module_inst.exports[i] = ExportInstance{
-                        .name = exp.name,
-                        .value = .{ .func = func_addr },
-                    };
+                    break :blk .{ .func = module_inst.func_addrs[func_idx_usize] };
                 },
-                .table => |table_idx| {
+                .table => |table_idx| blk: {
                     const table_idx_usize = @as(usize, table_idx);
                     if (table_idx_usize >= module_inst.table_addrs.len) {
                         return error.InvalidTableIndex;
                     }
-                    const table_addr = module_inst.table_addrs[table_idx_usize];
-                    module_inst.exports[i] = ExportInstance{
-                        .name = exp.name,
-                        .value = .{ .table = table_addr },
-                    };
+                    break :blk .{ .table = module_inst.table_addrs[table_idx_usize] };
                 },
-                .mem => |mem_idx| {
+                .mem => |mem_idx| blk: {
                     const mem_idx_usize = @as(usize, mem_idx);
                     if (mem_idx_usize >= module_inst.mem_addrs.len) {
                         return error.InvalidMemIndex;
                     }
-                    const mem_addr = module_inst.mem_addrs[mem_idx_usize];
-                    module_inst.exports[i] = ExportInstance{
-                        .name = exp.name,
-                        .value = .{ .mem = mem_addr },
-                    };
+                    break :blk .{ .mem = module_inst.mem_addrs[mem_idx_usize] };
                 },
-                .global => |global_idx| {
+                .global => |global_idx| blk: {
                     const global_idx_usize = @as(usize, global_idx);
                     if (global_idx_usize >= module_inst.global_addrs.len) {
                         return error.InvalidGlobalIndex;
                     }
-                    const global_addr = module_inst.global_addrs[global_idx_usize];
-                    module_inst.exports[i] = ExportInstance{
-                        .name = exp.name,
-                        .value = .{ .global = global_addr },
-                    };
+                    break :blk .{ .global = module_inst.global_addrs[global_idx_usize] };
                 },
-            }
+            };
 
-            if (module_inst.exports_by_name.contains(exp.name)) {
+            module_inst.exports[i] = ExportInstance{ .name = name, .value = value };
+
+            if (module_inst.exports_by_name.contains(name)) {
                 return error.DuplicateExportName;
             }
 
-            try module_inst.exports_by_name.put(exp.name, module_inst.exports[i].value);
+            try module_inst.exports_by_name.put(name, value);
         }
 
         return module_inst;
@@ -2306,8 +2325,11 @@ pub const Store = struct {
     }
 
     fn registerHostFunc(self: *Store, ty: types.FuncType, func: HostFuncPtr) !FuncAddr {
+        const params = try self.allocator.dupe(types.ValType, ty.params);
+        errdefer self.allocator.free(params);
+        const results = try self.allocator.dupe(types.ValType, ty.results);
         const func_addr = self.funcs.items.len;
-        try self.funcs.append(self.allocator, .{ .host = .{ .type = ty, .code = func } });
+        try self.funcs.append(self.allocator, .{ .host = .{ .type = .{ .params = params, .results = results }, .code = func } });
         return func_addr;
     }
 
@@ -2517,12 +2539,19 @@ pub const ModuleInstance = struct {
     start_addr: ?FuncAddr,
 
     pub fn deinit(self: *ModuleInstance, allocator: Allocator) void {
+        for (self.types) |*ft| ft.deinit(allocator);
+        allocator.free(self.types);
         allocator.free(self.func_addrs);
         allocator.free(self.table_addrs);
         allocator.free(self.mem_addrs);
         allocator.free(self.data_addrs);
         allocator.free(self.global_addrs);
         allocator.free(self.elem_addrs);
+
+        for (self.exports) |exp| {
+            allocator.free(exp.name);
+        }
+
         allocator.free(self.exports);
         self.exports_by_name.deinit();
     }
@@ -2534,7 +2563,8 @@ const WasmFunc = struct {
     code: types.Func,
 };
 
-pub const HostFuncPtr = *const fn (*Runtime) anyerror!void;
+// use anyopaque to avoid dependency loops
+pub const HostFuncPtr = *const fn (*anyopaque) anyerror!void;
 
 pub const HostFunc = struct {
     type: types.FuncType,
@@ -2796,14 +2826,14 @@ pub const ValueStack = struct {
 
 pub const Runtime = struct {
     allocator: Allocator,
-    store: Store,
+    store: *Store,
     bytecode: Bytecode,
     stack: ValueStack,
     call_stack: FixedSizedStack(Frame, 16384),
     module: *ModuleInstance,
 
-    pub fn init(allocator: Allocator, store: Store, module: *ModuleInstance) !Runtime {
-        var lowering = try BytecodeLowering.init(allocator, &store);
+    pub fn init(allocator: Allocator, store: *Store, module: *ModuleInstance) !Runtime {
+        var lowering = try BytecodeLowering.init(allocator, store);
         defer lowering.deinit();
 
         return Runtime{
@@ -2818,9 +2848,8 @@ pub const Runtime = struct {
 
     pub fn deinit(self: *Runtime) void {
         self.bytecode.deinit(self.allocator);
-        self.module.deinit(self.allocator);
-        self.allocator.destroy(self.module);
-        self.store.deinit();
+        self.module.deinit(self.store.allocator);
+        self.store.allocator.destroy(self.module);
     }
 
     /// Invokes the start function of the module, if it has one.
@@ -2913,7 +2942,7 @@ pub const Runtime = struct {
             },
             .host => |host_func| {
                 results_count = host_func.type.results.len;
-                try host_func.code(self);
+                try host_func.code(@ptrCast(self));
             },
         }
 
@@ -3180,7 +3209,7 @@ pub const Runtime = struct {
                     const func_type = host_func.type;
                     const expected_stack_size_after = stack_size_before + func_type.results.len - func_type.params.len;
 
-                    try host_func.code(self);
+                    try host_func.code(@ptrCast(self));
 
                     if (builtin.mode == .Debug) {
                         // validate that host func returned the expected number of results and that they are of the expected types

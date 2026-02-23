@@ -7,6 +7,7 @@ const runtime = waddle.runtime;
 const types = waddle.types;
 const Value = runtime.Value;
 const Runtime = runtime.Runtime;
+const Store = runtime.Store;
 
 pub fn main() !void {
     if (builtin.mode == .Debug) {
@@ -78,7 +79,20 @@ fn run(allocator: std.mem.Allocator) !void {
     @memcpy(full_vm_args[1..], vm_args);
     var host_ctx = try wasi_host.WasiSnapshotPreview1.init(allocator, preopen_dirs.items, full_vm_args, &.{});
     defer host_ctx.deinit();
-    var vm = try createVM(arena_alloc, wasm_path.?, @ptrCast(&host_ctx));
+    var store = runtime.Store.init(allocator, @ptrCast(&host_ctx));
+    defer store.deinit();
+    var converted_wasm_path: ?[]const u8 = null;
+    defer if (converted_wasm_path) |p| {
+        std.fs.deleteFileAbsolute(p) catch {};
+        allocator.free(p);
+    };
+
+    if (std.mem.endsWith(u8, wasm_path.?, ".wat")) {
+        converted_wasm_path = try wat2wasm(allocator, wasm_path.?);
+    }
+
+    const module_path = converted_wasm_path orelse wasm_path.?;
+    var vm = try createVM(arena_alloc, module_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
     defer vm.deinit();
     _ = try vm.invokeStartFunc();
 
@@ -165,17 +179,51 @@ fn specTestPrintChar(vm: *Runtime) !void {
     _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
 }
 
-fn createVM(allocator: std.mem.Allocator, module_path: []const u8, host_ctx: ?*anyopaque) !Runtime {
-    var store = runtime.Store.init(allocator, host_ctx);
+// use bundled `res/tools/wat2wasm.wasm` to convert the wat module to wasm
+// returns the allocated path of the output .wasm file (caller must free)
+fn wat2wasm(allocator: std.mem.Allocator, wat_path: []const u8) ![]const u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_dir = try std.fs.selfExeDirPath(&path_buf);
+    const wat2wasm_path = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "..", "res", "tools", "wat2wasm.wasm" });
+    defer allocator.free(wat2wasm_path);
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const wat_path_resolved = try std.fs.path.resolve(allocator, &.{ cwd, wat_path });
+    defer allocator.free(wat_path_resolved);
+    // Generate a unique output path under the OS temp directory.
+    var rand_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+    var rand_enc: [std.fs.base64_encoder.calcSize(8)]u8 = undefined;
+    _ = std.fs.base64_encoder.encode(&rand_enc, &rand_bytes);
+    const out_wasm_path = try std.fmt.allocPrint(allocator, "/tmp/waddle-{s}.wasm", .{rand_enc});
+    errdefer allocator.free(out_wasm_path);
+    const tools_dir = std.fs.path.dirname(wat2wasm_path).?;
+    var ctx = try wasi_host.WasiSnapshotPreview1.init(
+        allocator,
+        &.{ cwd, tools_dir, "/tmp" },
+        &.{ "wat2wasm.wasm", wat_path_resolved, "-o", out_wasm_path },
+        &.{},
+    );
+    defer ctx.deinit();
+    var store = runtime.Store.init(allocator, @ptrCast(&ctx));
+    defer store.deinit();
+    var wat2wasm_vm = try createVM(allocator, wat2wasm_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
+    defer wat2wasm_vm.deinit();
+    const res = try wat2wasm_vm.invokeExportedFunc(allocator, "_start", &.{});
+    allocator.free(res);
+
+    return out_wasm_path;
+}
+
+fn createVM(allocator: std.mem.Allocator, module_path: []const u8, store: *Store, imports: []const Store.Import) !Runtime {
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
     var file_read_buffer: [4096]u8 = undefined;
     var reader = file.reader(&file_read_buffer);
     const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
-    var module: types.Module = undefined;
     var parser = parse.Parser.init(allocator, bytes);
-    module = try parser.readModule();
-    const imports = wasi_host.WasiSnapshotPreview1.getImports();
-    const module_inst = try store.instantiate(module, &imports);
+    var module = try parser.readModule();
+    defer module.deinit(allocator);
+    const module_inst = try store.instantiate(module, imports);
     return try Runtime.init(allocator, store, module_inst);
 }
