@@ -2728,7 +2728,7 @@ fn FixedSizedStack(comptime T: type, Size: comptime_int) type {
 }
 
 pub const ValueStack = struct {
-    const Size = 16384;
+    const Size = 65536;
     const Self = @This();
     values: [Size]u64,
     types: [Size]ValType,
@@ -3637,7 +3637,7 @@ pub const Runtime = struct {
 
                         const new_byte_size: usize = @intCast(new_pages * page_size);
                         const old_len = mem_inst.data.len;
-                        const new_data = self.allocator.realloc(mem_inst.data, new_byte_size) catch break :grow;
+                        const new_data = self.store.allocator.realloc(mem_inst.data, new_byte_size) catch break :grow;
                         @memset(new_data[old_len..], 0);
                         mem_inst.data = new_data;
                         result = @bitCast(old_pages);

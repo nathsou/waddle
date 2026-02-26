@@ -61,9 +61,29 @@ pub const WasiSnapshotPreview1 = struct {
 
     const ErrNo = enum(u16) {
         success = 0,
+        acces = 2,
         badf = 8,
+        exist = 20,
+        inval = 28,
+        io = 29,
         noent = 44,
+        notdir = 54,
+        notempty = 55,
+        notcapable = 76,
     };
+
+    fn dtypeToWasiFiletype(dtype: u8) u8 {
+        return switch (dtype) {
+            1 => 0, // DT_FIFO -> UNKNOWN (no FIFO in WASI)
+            2 => 2, // DT_CHR  -> CHARACTER_DEVICE
+            4 => 3, // DT_DIR  -> DIRECTORY
+            6 => 1, // DT_BLK  -> BLOCK_DEVICE
+            8 => 4, // DT_REG  -> REGULAR_FILE
+            10 => 7, // DT_LNK  -> SYMBOLIC_LINK
+            12 => 6, // DT_SOCK -> SOCKET_STREAM
+            else => 0, // UNKNOWN
+        };
+    }
 
     fn timespecToNs(ts: std.posix.timespec) u64 {
         if (ts.sec < 0) return 0;
@@ -558,13 +578,99 @@ pub const WasiSnapshotPreview1 = struct {
         try pushErrNo(vm, errno);
     }
 
+    fn fdReaddir(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
+        const ctx = try vm.store.getContext(WasiSnapshotPreview1);
+        const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
+        // sig: (fd i32, buf_ptr i32, buf_len i32, cookie i64, bufused_ptr i32) -> i32
+        const bufused_ptr: usize = @intCast(try vm.stack.pop(.i32));
+        const cookie: i64 = try vm.stack.pop(.i64);
+        const buf_len: usize = @intCast(try vm.stack.pop(.i32));
+        const buf_ptr: usize = @intCast(try vm.stack.pop(.i32));
+        const wasi_fd: i32 = try vm.stack.pop(.i32);
+
+        if (ctx.wasiFdToHostFd(wasi_fd)) |host_fd| {
+            // dup the fd because fdopendir takes ownership of it.
+            const dup_fd = try std.posix.dup(host_fd);
+            const dir = std.c.fdopendir(dup_fd) orelse {
+                std.posix.close(dup_fd);
+                try pushErrNo(vm, .io);
+                return;
+            };
+            defer _ = std.c.closedir(dir);
+
+            // Position to cookie. WASI cookie 0 means start of directory;
+            // non-zero values are telldir positions from a prior call.
+            if (cookie == 0) {
+                std.c.rewinddir(dir);
+            } else {
+                std.c.seekdir(dir, @intCast(cookie));
+            }
+
+            var buf_used: usize = 0;
+            outer: while (true) {
+                const entry = std.c.readdir(dir) orelse break;
+                const name = std.mem.sliceTo(&entry.name, 0);
+                const name_len = name.len;
+                const wasi_entry_size = 24 + name_len;
+                if (buf_used + wasi_entry_size > buf_len) break :outer;
+                // telldir after readdir gives the position of the next entry (d_next).
+                const next_pos = std.c.telldir(dir);
+                const entry_ptr = buf_ptr + buf_used;
+                var dirent_bytes = [_]u8{0} ** 24;
+                std.mem.writeInt(u64, dirent_bytes[0..8], @as(u64, @bitCast(@as(i64, next_pos))), .little);
+                std.mem.writeInt(u64, dirent_bytes[8..16], @as(u64, @intCast(entry.ino)), .little);
+                std.mem.writeInt(u32, dirent_bytes[16..20], @intCast(name_len), .little);
+                dirent_bytes[20] = dtypeToWasiFiletype(@field(entry, "type"));
+                try mem_inst.writeBytes(entry_ptr, &dirent_bytes);
+                try mem_inst.writeBytes(entry_ptr + 24, name);
+                buf_used += wasi_entry_size;
+            }
+
+            try mem_inst.write(.i32, bufused_ptr, @intCast(buf_used));
+            try pushErrNo(vm, .success);
+        } else {
+            try pushErrNo(vm, .badf);
+        }
+    }
+
+    fn pathCreateDirectory(ctx_ptr: *anyopaque) !void {
+        const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
+        const ctx = try vm.store.getContext(WasiSnapshotPreview1);
+        const mem_inst = &vm.store.mems.items[vm.module.mem_addrs[0]];
+        const args = vm.stack.staticPopValues(.i32, 3);
+        const wasi_fd: i32 = args[0];
+        const path_ptr: usize = @intCast(args[1]);
+        const path_len: usize = @intCast(args[2]);
+
+        if (ctx.wasiFdToHostFd(wasi_fd)) |host_dir_fd| {
+            const sub_path = mem_inst.data[path_ptr .. path_ptr + path_len];
+            std.posix.mkdirat(host_dir_fd, sub_path, 0o755) catch |err| {
+                const errno: ErrNo = switch (err) {
+                    error.PathAlreadyExists => .exist,
+                    error.FileNotFound => .noent,
+                    error.NotDir => .notdir,
+                    error.AccessDenied => .acces,
+                    else => .io,
+                };
+
+                try pushErrNo(vm, errno);
+                return;
+            };
+
+            try pushErrNo(vm, .success);
+        } else {
+            try pushErrNo(vm, .badf);
+        }
+    }
+
     fn procExit(ctx_ptr: *anyopaque) !void {
         const vm: *Runtime = @ptrCast(@alignCast(ctx_ptr));
         const exit_code: u8 = @intCast(try vm.stack.pop(.i32));
         std.posix.exit(exit_code);
     }
 
-    pub fn getImports() [16]runtime.Store.Import {
+    pub fn getImports() [18]runtime.Store.Import {
         const scope = "wasi_snapshot_preview1";
 
         return [_]runtime.Store.Import{
@@ -647,6 +753,16 @@ pub const WasiSnapshotPreview1 = struct {
                 .module = scope,
                 .name = "path_filestat_get",
                 .value = .{ .func = pathFilestatGet },
+            },
+            .{
+                .module = scope,
+                .name = "fd_readdir",
+                .value = .{ .func = fdReaddir },
+            },
+            .{
+                .module = scope,
+                .name = "path_create_directory",
+                .value = .{ .func = pathCreateDirectory },
             },
         };
     }
