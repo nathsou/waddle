@@ -5,6 +5,7 @@ const wasi_host = @import("wasi_host.zig");
 const parse = waddle.parse;
 const runtime = waddle.runtime;
 const types = waddle.types;
+const wast = waddle.wast;
 const Value = runtime.Value;
 const Runtime = runtime.Runtime;
 const Store = runtime.Store;
@@ -67,7 +68,7 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 
     if (wasm_path == null) {
-        std.debug.print("Error: missing <file.wasm/.wat> argument\n", .{});
+        std.debug.print("Error: missing <file.wasm/.wat/.wast> argument\n", .{});
         printUsage(args[0]);
         return;
     }
@@ -89,6 +90,11 @@ fn run(allocator: std.mem.Allocator) !void {
 
     if (std.mem.endsWith(u8, wasm_path.?, ".wat")) {
         converted_wasm_path = try wat2wasm(allocator, wasm_path.?);
+    }
+
+    if (std.mem.endsWith(u8, wasm_path.?, ".wast")) {
+        try runSpecTest(allocator, wasm_path.?);
+        return;
     }
 
     const module_path = converted_wasm_path orelse wasm_path.?;
@@ -179,42 +185,6 @@ fn specTestPrintChar(vm: *Runtime) !void {
     _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
 }
 
-// use bundled `res/tools/wat2wasm.wasm` to convert the wat module to wasm
-// returns the allocated path of the output .wasm file (caller must free)
-fn wat2wasm(allocator: std.mem.Allocator, wat_path: []const u8) ![]const u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_dir = try std.fs.selfExeDirPath(&path_buf);
-    const wat2wasm_path = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "..", "res", "tools", "wat2wasm.wasm" });
-    defer allocator.free(wat2wasm_path);
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    const wat_path_resolved = try std.fs.path.resolve(allocator, &.{ cwd, wat_path });
-    defer allocator.free(wat_path_resolved);
-    // Generate a unique output path under the OS temp directory.
-    var rand_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
-    var rand_enc: [std.fs.base64_encoder.calcSize(8)]u8 = undefined;
-    _ = std.fs.base64_encoder.encode(&rand_enc, &rand_bytes);
-    const out_wasm_path = try std.fmt.allocPrint(allocator, "/tmp/waddle-{s}.wasm", .{rand_enc});
-    errdefer allocator.free(out_wasm_path);
-    const tools_dir = std.fs.path.dirname(wat2wasm_path).?;
-    var ctx = try wasi_host.WasiSnapshotPreview1.init(
-        allocator,
-        &.{ cwd, tools_dir, "/tmp" },
-        &.{ "wat2wasm.wasm", wat_path_resolved, "-o", out_wasm_path },
-        &.{},
-    );
-    defer ctx.deinit();
-    var store = runtime.Store.init(allocator, @ptrCast(&ctx));
-    defer store.deinit();
-    var wat2wasm_vm = try createVM(allocator, wat2wasm_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
-    defer wat2wasm_vm.deinit();
-    const res = try wat2wasm_vm.invokeExportedFunc(allocator, "_start", &.{});
-    allocator.free(res);
-
-    return out_wasm_path;
-}
-
 fn createVM(allocator: std.mem.Allocator, module_path: []const u8, store: *Store, imports: []const Store.Import) !Runtime {
     const file = try std.fs.cwd().openFile(module_path, .{});
     defer file.close();
@@ -226,4 +196,83 @@ fn createVM(allocator: std.mem.Allocator, module_path: []const u8, store: *Store
     defer module.deinit(allocator);
     const module_inst = try store.instantiate(module, imports);
     return try Runtime.init(allocator, store, module_inst);
+}
+
+fn runWasiModule(allocator: std.mem.Allocator, module_name: []const u8, host: *wasi_host.WasiSnapshotPreview1) !void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_dir = try std.fs.selfExeDirPath(&path_buf);
+    const tool_path = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "..", "res", "tools", module_name });
+    defer allocator.free(tool_path);
+    var store = runtime.Store.init(allocator, @ptrCast(host));
+    defer store.deinit();
+    var vm = try createVM(allocator, tool_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
+    defer vm.deinit();
+    const res = try vm.invokeExportedFunc(allocator, "_start", &.{});
+    allocator.free(res);
+}
+
+// use bundled `res/tools/wat2wasm.wasm` to convert the wat module to wasm
+// returns the allocated path of the output .wasm file (caller must free)
+fn wat2wasm(allocator: std.mem.Allocator, wat_path: []const u8) ![]const u8 {
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const wat_path_resolved = try std.fs.path.resolve(allocator, &.{ cwd, wat_path });
+    defer allocator.free(wat_path_resolved);
+    // Generate a unique output path under the OS temp directory.
+    var rand_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+    var rand_enc: [std.fs.base64_encoder.calcSize(8)]u8 = undefined;
+    _ = std.fs.base64_encoder.encode(&rand_enc, &rand_bytes);
+    const out_wasm_path = try std.fmt.allocPrint(allocator, "/tmp/waddle-{s}.wasm", .{rand_enc});
+    errdefer allocator.free(out_wasm_path);
+    var ctx = try wasi_host.WasiSnapshotPreview1.init(
+        allocator,
+        &.{ cwd, "/tmp" },
+        &.{ "wat2wasm.wasm", wat_path_resolved, "-o", out_wasm_path },
+        &.{},
+    );
+    defer ctx.deinit();
+    try runWasiModule(allocator, "wat2wasm.wasm", &ctx);
+    return out_wasm_path;
+}
+
+fn wast2json(allocator: std.mem.Allocator, wast_path: []const u8) ![]const u8 {
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    // Generate a unique output path under the OS temp directory.
+    var rand_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+    var rand_enc: [std.fs.base64_encoder.calcSize(8)]u8 = undefined;
+    _ = std.fs.base64_encoder.encode(&rand_enc, &rand_bytes);
+    const filename = std.mem.trimEnd(u8, std.fs.path.basename(wast_path), ".wast");
+    const out_json_path = try std.fmt.allocPrint(allocator, "/tmp/waddle-{s}/{s}.json", .{ rand_enc, filename });
+    const out_json_dir = std.fs.path.dirname(out_json_path).?;
+    try std.fs.makeDirAbsolute(out_json_dir);
+    errdefer allocator.free(out_json_path);
+    const wast_dir = std.fs.path.dirname(wast_path).?;
+    var ctx = try wasi_host.WasiSnapshotPreview1.init(
+        allocator,
+        &.{ cwd, wast_dir, "/tmp" },
+        &.{ "wast2json.wasm", wast_path, "-o", out_json_path },
+        &.{},
+    );
+    defer ctx.deinit();
+    try runWasiModule(allocator, "wast2json.wasm", &ctx);
+    return out_json_path;
+}
+
+fn runSpecTest(allocator: std.mem.Allocator, spec_test_path: []const u8) !void {
+    const json_path = try wast2json(allocator, spec_test_path);
+    defer allocator.free(json_path);
+    const dir_path = std.fs.path.dirname(json_path).?;
+    defer std.fs.deleteTreeAbsolute(dir_path) catch {};
+    const file = try std.fs.cwd().openFile(json_path, .{});
+    defer file.close();
+    var file_read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(&file_read_buffer);
+    const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
+    defer allocator.free(bytes);
+    const parsed = try wast.parse(allocator, bytes);
+    defer parsed.deinit();
+    std.debug.print("{any}\n", .{parsed.value});
 }
