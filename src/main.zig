@@ -98,7 +98,7 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 
     const module_path = converted_wasm_path orelse wasm_path.?;
-    var vm = try createVM(arena_alloc, module_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
+    var vm = try Runtime.initFromFile(arena_alloc, module_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
     defer vm.deinit();
     _ = try vm.invokeStartFunc();
 
@@ -185,27 +185,13 @@ fn specTestPrintChar(vm: *Runtime) !void {
     _ = try std.posix.write(std.posix.STDOUT_FILENO, &.{char_code});
 }
 
-fn createVM(allocator: std.mem.Allocator, module_path: []const u8, store: *Store, imports: []const Store.Import) !Runtime {
-    const file = try std.fs.cwd().openFile(module_path, .{});
-    defer file.close();
-    var file_read_buffer: [4096]u8 = undefined;
-    var reader = file.reader(&file_read_buffer);
-    const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
-    var parser = parse.Parser.init(allocator, bytes);
-    var module = try parser.readModule();
-    defer module.deinit(allocator);
-    const module_inst = try store.instantiate(module, imports);
-    return try Runtime.init(allocator, store, module_inst);
-}
-
 fn runWasiModule(allocator: std.mem.Allocator, module_name: []const u8, host: *wasi_host.WasiSnapshotPreview1) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_dir = try std.fs.selfExeDirPath(&path_buf);
     const tool_path = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "..", "res", "tools", module_name });
     defer allocator.free(tool_path);
     var store = runtime.Store.init(allocator, @ptrCast(host));
-    defer store.deinit();
-    var vm = try createVM(allocator, tool_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
+    var vm = try Runtime.initFromFile(allocator, tool_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
     defer vm.deinit();
     const res = try vm.invokeExportedFunc(allocator, "_start", &.{});
     allocator.free(res);
@@ -274,5 +260,7 @@ fn runSpecTest(allocator: std.mem.Allocator, spec_test_path: []const u8) !void {
     defer allocator.free(bytes);
     const parsed = try wast.parse(allocator, bytes);
     defer parsed.deinit();
-    std.debug.print("{any}\n", .{parsed.value});
+    var interpreter = try wast.WastInterpreter.init(allocator, json_path);
+    defer interpreter.deinit();
+    try interpreter.run(parsed.value);
 }

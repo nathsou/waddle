@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
+const parse = @import("parse.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const LocalIndex = types.LocalIndex;
@@ -35,6 +36,18 @@ pub const Value = union(ValType) {
             .funcref => try writer.print("<funcref>", .{}),
             .externref => try writer.print("<externref>", .{}),
         }
+    }
+
+    pub fn eql(self: Value, other: Value) bool {
+        if (self.getType() != other.getType()) return false;
+        return switch (self) {
+            .i32 => |n| n == other.i32,
+            .i64 => |n| n == other.i64,
+            .f32 => |x| x == other.f32,
+            .f64 => |x| x == other.f64,
+            .funcref => |func_ref| func_ref == other.funcref,
+            .externref => |ref_ptr| ref_ptr == other.externref,
+        };
     }
 
     fn matchingType(comptime VT: ValType) type {
@@ -1978,11 +1991,15 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         for (self.tables.items) |table| {
-            self.allocator.free(table.elem);
+            if (table.elem.len > 0) {
+                self.allocator.free(table.elem);
+            }
         }
 
         for (self.mems.items) |mem| {
-            self.allocator.free(mem.data);
+            if (mem.data.len > 0) {
+                self.allocator.free(mem.data);
+            }
         }
 
         for (self.elems.items) |*elem| {
@@ -2850,6 +2867,20 @@ pub const Runtime = struct {
         self.bytecode.deinit(self.allocator);
         self.module.deinit(self.store.allocator);
         self.store.allocator.destroy(self.module);
+        self.store.deinit();
+    }
+
+    pub fn initFromFile(allocator: std.mem.Allocator, module_path: []const u8, store: *Store, imports: []const Store.Import) !Runtime {
+        const file = try std.fs.cwd().openFile(module_path, .{});
+        defer file.close();
+        var file_read_buffer: [4096]u8 = undefined;
+        var reader = file.reader(&file_read_buffer);
+        const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
+        var parser = parse.Parser.init(allocator, bytes);
+        var module = try parser.readModule();
+        defer module.deinit(allocator);
+        const module_inst = try store.instantiate(module, imports);
+        return try Runtime.init(allocator, store, module_inst);
     }
 
     /// Invokes the start function of the module, if it has one.
