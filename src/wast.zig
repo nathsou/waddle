@@ -114,7 +114,7 @@ pub const WastInterpreter = struct {
     }
 
     pub fn run(self: *WastInterpreter, spec: WastSpec) !void {
-        for (spec.commands) |cmd| {
+        for (spec.commands) |*cmd| {
             self.runCommand(cmd) catch |err| {
                 std.debug.print("Error executing command {any}\n", .{cmd});
                 return err;
@@ -122,7 +122,41 @@ pub const WastInterpreter = struct {
         }
     }
 
-    pub fn runCommand(self: *WastInterpreter, cmd: Command) !void {
+    fn runAction(self: *WastInterpreter, cmd: *const Command) !void {
+        const action = cmd.action.?;
+        switch (action.type) {
+            .invoke => {
+                const args = try self.allocator.alloc(runtime.Value, action.args.len);
+                defer self.allocator.free(args);
+                for (action.args, 0..) |*arg, i| {
+                    args[i] = try arg.toValue();
+                }
+
+                if (self.current_module) |*mod| {
+                    const results = try mod.runtime.invokeExportedFunc(self.allocator, action.field, args);
+                    defer self.allocator.free(results);
+                    if (cmd.expected.?.len != results.len) {
+                        return error.ExpectedResultCountMismatch;
+                    }
+
+                    for (results, 0..) |val, i| {
+                        const expected_val = try cmd.expected.?[i].toValue();
+                        if (!val.eql(expected_val)) {
+                            std.debug.print("Expected {any}, got {any}\n", .{ expected_val, val });
+                            return error.ExpectedResultValueMismatch;
+                        }
+                    }
+                } else {
+                    return error.NoModuleLoaded;
+                }
+            },
+            else => {
+                return error.UnsupportedActionType;
+            },
+        }
+    }
+
+    pub fn runCommand(self: *WastInterpreter, cmd: *const Command) !void {
         switch (cmd.type) {
             .module => {
                 const filename = cmd.filename.?;
@@ -145,34 +179,24 @@ pub const WastInterpreter = struct {
                 };
             },
             .assert_return => {
-                const action = cmd.action.?;
-                switch (action.type) {
-                    .invoke => {
-                        const args = try self.allocator.alloc(runtime.Value, action.args.len);
-                        defer self.allocator.free(args);
-                        for (action.args, 0..) |*arg, i| {
-                            args[i] = try arg.toValue();
-                        }
+                try self.runAction(cmd);
+            },
+            .assert_trap => {
+                const error_str = if (self.runAction(cmd)) |_| {
+                    return error.ExpectedTrap;
+                } else |err| blk: {
+                    break :blk switch (err) {
+                        error.IntegerDivideByZero => "integer divide by zero",
+                        error.IntegerOverflow => "integer overflow",
+                        else => {
+                            std.debug.print("Unhandled error: {any}\n", .{err});
+                            return error.UnhandledTrapError;
+                        },
+                    };
+                };
 
-                        if (self.current_module) |*mod| {
-                            const results = try mod.runtime.invokeExportedFunc(self.allocator, action.field, args);
-                            defer self.allocator.free(results);
-                            if (cmd.expected.?.len != results.len) {
-                                return error.ExpectedResultCountMismatch;
-                            }
-
-                            for (results, 0..) |val, i| {
-                                if (!val.eql(try cmd.expected.?[i].toValue())) {
-                                    return error.ExpectedResultValueMismatch;
-                                }
-                            }
-                        } else {
-                            return error.NoModuleLoaded;
-                        }
-                    },
-                    else => {
-                        return error.UnsupportedActionType;
-                    },
+                if (!std.mem.eql(u8, cmd.text.?, error_str)) {
+                    return error.ExpectedTrapMessageMismatch;
                 }
             },
             else => {},
