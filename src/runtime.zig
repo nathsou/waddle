@@ -83,7 +83,7 @@ pub const Value = union(ValType) {
         };
     }
 
-    fn encode(self: Value) u64 {
+    pub fn encode(self: Value) u64 {
         return switch (self) {
             .i32 => |n| staticEncode(.i32, n),
             .i64 => |n| staticEncode(.i64, n),
@@ -94,7 +94,7 @@ pub const Value = union(ValType) {
         };
     }
 
-    fn decode(val_type: ValType, val: u64) Value {
+    pub fn decode(val_type: ValType, val: u64) Value {
         return switch (val_type) {
             .i32 => .{ .i32 = staticDecode(.i32, val) },
             .i64 => .{ .i64 = staticDecode(.i64, val) },
@@ -3087,8 +3087,8 @@ pub const Runtime = struct {
         return lhs >> shift;
     }
 
-    fn floatCopysign(comptime T: type, mag: T, sign: T) T {
-        const bits = @bitSizeOf(T);
+    fn floatCopySign(comptime T: type, mag: T, sign: T) T {
+        const bits = @typeInfo(T).float.bits;
         const IT = std.meta.Int(.unsigned, bits);
         const sign_mask: IT = 1 << (bits - 1);
         const mag_bits: IT = @bitCast(mag);
@@ -4001,7 +4001,7 @@ pub const Runtime = struct {
                 },
                 .f32_copysign => {
                     const args = self.popValues(.f32, 2);
-                    try self.push(.f32, floatCopysign(f32, args[0], args[1]));
+                    try self.push(.f32, floatCopySign(f32, args[0], args[1]));
                 },
                 .f64_abs => {
                     const val = self.pop(.f64);
@@ -4057,7 +4057,7 @@ pub const Runtime = struct {
                 },
                 .f64_copysign => {
                     const args = self.popValues(.f64, 2);
-                    try self.push(.f64, floatCopysign(f64, args[0], args[1]));
+                    try self.push(.f64, floatCopySign(f64, args[0], args[1]));
                 },
                 .i32_trunc_f32_s => {
                     try self.push(.i32, try truncFloat(i32, f32, self.pop(.f32)));

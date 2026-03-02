@@ -47,7 +47,23 @@ pub const Const = struct {
     type: ConstType,
     value: ?[]const u8 = null,
 
-    fn toValue(self: Const) !runtime.Value {
+    fn isNanCanonical(self: *Const) bool {
+        if (self.value) |val| {
+            return std.mem.eql(u8, val, "nan:canonical");
+        }
+
+        return false;
+    }
+
+    fn isNanArithmetic(self: *Const) bool {
+        if (self.value) |val| {
+            return std.mem.eql(u8, val, "nan:arithmetic");
+        }
+
+        return false;
+    }
+
+    fn toValue(self: *Const) !runtime.Value {
         const value = self.value orelse {
             return error.MissingConstValue;
         };
@@ -56,18 +72,18 @@ pub const Const = struct {
             .i32 => .{ .i32 = @bitCast(try std.fmt.parseInt(u32, value, 10)) },
             .i64 => .{ .i64 = @bitCast(try std.fmt.parseInt(u64, value, 10)) },
             .f32 => {
-                if (std.mem.eql(u8, value, "nan:canonical")) {
+                if (self.isNanCanonical()) {
                     return .{ .f32 = @bitCast(@as(u32, 0x7fc00000)) };
-                } else if (std.mem.eql(u8, value, "nan:arithmetic")) {
+                } else if (self.isNanArithmetic()) {
                     return .{ .f32 = @bitCast(@as(u32, 0x7fc00001)) };
                 } else {
                     return .{ .f32 = @bitCast(try std.fmt.parseInt(u32, value, 10)) };
                 }
             },
             .f64 => {
-                if (std.mem.eql(u8, value, "nan:canonical")) {
+                if (self.isNanCanonical()) {
                     return .{ .f64 = @bitCast(@as(u64, 0x7ff8000000000000)) };
-                } else if (std.mem.eql(u8, value, "nan:arithmetic")) {
+                } else if (self.isNanArithmetic()) {
                     return error.NanArithmeticNotSupported;
                 } else {
                     return .{ .f64 = @bitCast(try std.fmt.parseInt(u64, value, 10)) };
@@ -79,7 +95,7 @@ pub const Const = struct {
         };
     }
 
-    fn matches(self: Const, val: runtime.Value) !bool {
+    fn matches(self: *Const, val: runtime.Value) !bool {
         if (std.mem.eql(u8, self.value.?, "nan:canonical")) {
             return switch (self.type) {
                 .f32 => @as(u32, @bitCast(val.f32)) & 0x7FFFFFFF == 0x7FC00000,
@@ -96,8 +112,32 @@ pub const Const = struct {
             };
         }
 
-        const expected_val = try self.toValue();
-        return val.eql(expected_val);
+        const expected_val = try std.fmt.parseInt(u64, self.value.?, 10);
+        return expected_val == val.encode();
+    }
+
+    pub fn format(
+        self: *Const,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const ty = switch (self.type) {
+            .i32 => "i32",
+            .i64 => "i64",
+            .f32 => "f32",
+            .f64 => "f64",
+            .externref => "externref",
+            .funcref => "funcref",
+        };
+
+        try writer.print("{s}", .{ty});
+
+        if (self.value) |raw_val| {
+            if (self.toValue()) |val| {
+                try writer.print("({f})", .{val});
+            } else |_| {
+                try writer.print("({s})", .{raw_val});
+            }
+        }
     }
 };
 
@@ -182,9 +222,9 @@ pub const WastInterpreter = struct {
                     }
 
                     for (results, 0..) |val, i| {
-                        const expected = cmd.expected.?[i];
+                        const expected = &cmd.expected.?[i];
                         if (!(try expected.matches(val))) {
-                            std.debug.print("Expected {any}, got {any}\n", .{ expected, val });
+                            std.debug.print("Expected {f}, got {any}\n", .{ expected, val });
                             return error.ExpectedResultValueMismatch;
                         }
                     }
