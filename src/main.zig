@@ -191,6 +191,7 @@ fn runWasiModule(allocator: std.mem.Allocator, module_name: []const u8, host: *w
     const tool_path = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "..", "res", "tools", module_name });
     defer allocator.free(tool_path);
     var store = runtime.Store.init(allocator, @ptrCast(host));
+    defer store.deinit();
     var vm = try Runtime.initFromFile(allocator, tool_path, &store, &wasi_host.WasiSnapshotPreview1.getImports());
     defer vm.deinit();
     const res = try vm.invokeExportedFunc(allocator, "_start", &.{});

@@ -2867,7 +2867,6 @@ pub const Runtime = struct {
         self.bytecode.deinit(self.allocator);
         self.module.deinit(self.store.allocator);
         self.store.allocator.destroy(self.module);
-        self.store.deinit();
     }
 
     pub fn initFromFile(allocator: std.mem.Allocator, module_path: []const u8, store: *Store, imports: []const Store.Import) !Runtime {
@@ -3100,6 +3099,53 @@ pub const Runtime = struct {
     fn truncFloat(comptime TI: type, comptime TF: type, val: TF) !TI {
         if (std.math.isNan(val) or std.math.isInf(val)) return error.InvalidConversionToInteger;
         return @intFromFloat(val);
+    }
+
+    // https://webassembly.github.io/spec/core/exec/numerics.html#xref-exec-numerics-op-fmin-mathrm-fmin-n-z-1-z-2
+    fn floatMin(comptime T: type, a: T, b: T) T {
+        if (std.math.isNan(a) or std.math.isNan(b)) {
+            return std.math.nan(T);
+        }
+
+        if (a == 0.0 and b == 0.0) {
+            const UIntType = std.meta.Int(.unsigned, @typeInfo(T).float.bits);
+            const a_bits: UIntType = @bitCast(a);
+            const b_bits: UIntType = @bitCast(b);
+            // if either value is -0.0, the result is -0.0; otherwise +0.0
+            return @bitCast(a_bits | b_bits);
+        }
+
+        return if (a < b) a else b;
+    }
+
+    // https://webassembly.github.io/spec/core/exec/numerics.html#xref-exec-numerics-op-fmax-mathrm-fmax-n-z-1-z-2
+    fn floatMax(comptime T: type, a: T, b: T) T {
+        if (std.math.isNan(a) or std.math.isNan(b)) {
+            return std.math.nan(T);
+        }
+
+        if (a == 0.0 and b == 0.0) {
+            const UIntType = std.meta.Int(.unsigned, @typeInfo(T).float.bits);
+            const a_bits: UIntType = @bitCast(a);
+            const b_bits: UIntType = @bitCast(b);
+            // if either value is +0.0, the result is +0.0; otherwise -0.0
+            return @bitCast(a_bits & b_bits);
+        }
+
+        return if (a > b) a else b;
+    }
+
+    // https://webassembly.github.io/spec/core/exec/numerics.html#xref-exec-numerics-op-fnearest-mathrm-fnearest-n-z
+    fn floatNearest(comptime T: type, val: T) T {
+        if (val == 0.5) {
+            return 0.0;
+        }
+
+        if (val == -0.5) {
+            return -0.0;
+        }
+
+        return @round(val);
     }
 
     fn intExtend(comptime Dst: type, comptime Src: type, val: anytype) Dst {
@@ -3923,7 +3969,7 @@ pub const Runtime = struct {
                 },
                 .f32_nearest => {
                     const val = self.pop(.f32);
-                    try self.push(.f32, @round(val));
+                    try self.push(.f32, floatNearest(f32, val));
                 },
                 .f32_sqrt => {
                     const val = self.pop(.f32);
@@ -3947,11 +3993,11 @@ pub const Runtime = struct {
                 },
                 .f32_min => {
                     const args = self.popValues(.f32, 2);
-                    try self.push(.f32, @min(args[0], args[1]));
+                    try self.push(.f32, floatMin(f32, args[0], args[1]));
                 },
                 .f32_max => {
                     const args = self.popValues(.f32, 2);
-                    try self.push(.f32, @max(args[0], args[1]));
+                    try self.push(.f32, floatMax(f32, args[0], args[1]));
                 },
                 .f32_copysign => {
                     const args = self.popValues(.f32, 2);
@@ -3979,7 +4025,7 @@ pub const Runtime = struct {
                 },
                 .f64_nearest => {
                     const val = self.pop(.f64);
-                    try self.push(.f64, @round(val));
+                    try self.push(.f64, floatNearest(f64, val));
                 },
                 .f64_sqrt => {
                     const val = self.pop(.f64);
@@ -4003,11 +4049,11 @@ pub const Runtime = struct {
                 },
                 .f64_min => {
                     const args = self.popValues(.f64, 2);
-                    try self.push(.f64, @min(args[0], args[1]));
+                    try self.push(.f64, floatMin(f64, args[0], args[1]));
                 },
                 .f64_max => {
                     const args = self.popValues(.f64, 2);
-                    try self.push(.f64, @max(args[0], args[1]));
+                    try self.push(.f64, floatMax(f64, args[0], args[1]));
                 },
                 .f64_copysign => {
                     const args = self.popValues(.f64, 2);
