@@ -3096,9 +3096,66 @@ pub const Runtime = struct {
         return @bitCast((mag_bits & ~sign_mask) | (sign_bits & sign_mask));
     }
 
-    fn truncFloat(comptime TI: type, comptime TF: type, val: TF) !TI {
-        if (std.math.isNan(val) or std.math.isInf(val)) return error.InvalidConversionToInteger;
-        return @intFromFloat(val);
+    fn floatTruncBoundsCheck(comptime TI: type, comptime TF: type, val: TF) enum { underflow, overflow, valid } {
+        if (TI == i32 and TF == f32) {
+            if (val >= 2147483600.0) return .overflow;
+            if (val < -2147483600.0) return .underflow;
+        }
+
+        if (TI == u32 and TF == f32) {
+            if (val >= 4294967300.0) return .overflow;
+            if (val <= -1.0) return .underflow;
+        }
+
+        if (TI == i32 and TF == f64) {
+            if (val >= 2147483648.0) return .overflow;
+            if (val <= -2147483649.0) return .underflow;
+        }
+
+        if (TI == u32 and TF == f64) {
+            if (val >= 4294967296.0) return .overflow;
+            if (val <= -1.0) return .underflow;
+        }
+
+        if (TI == i64 and TF == f32) {
+            if (val >= 9223372000000000000.0) return .overflow;
+            if (val < -9223372000000000000.0) return .underflow;
+        }
+
+        if (TI == u64 and TF == f32) {
+            if (val >= 18446744000000000000.0) return .overflow;
+            if (val <= -1.0) return .underflow;
+        }
+
+        if (TI == i64 and TF == f64) {
+            if (val >= 9223372036854776000.0) return .overflow;
+            if (val < -9223372036854776000.0) return .underflow;
+        }
+
+        if (TI == u64 and TF == f64) {
+            if (val >= 18446744073709552000.0) return .overflow;
+            if (val <= -1.0) return .underflow;
+        }
+
+        return .valid;
+    }
+
+    // https://webassembly.github.io/spec/core/exec/numerics.html#xref-exec-numerics-op-trunc-mathrm-trunc-mathsf-u-m-n-z
+    fn floatTrunc(comptime TI: type, comptime TF: type, val: TF) !TI {
+        if (std.math.isNan(val)) return error.InvalidConversionToInteger;
+        return switch (floatTruncBoundsCheck(TI, TF, val)) {
+            .underflow, .overflow => error.IntegerOverflow,
+            .valid => @intFromFloat(val),
+        };
+    }
+
+    fn floatTruncSat(comptime TI: type, comptime TF: type, val: TF) TI {
+        if (std.math.isNan(val)) return 0;
+        return switch (floatTruncBoundsCheck(TI, TF, val)) {
+            .underflow => if (@typeInfo(TI).int.signedness == .signed) @as(TI, std.math.minInt(TI)) else 0,
+            .overflow => if (@typeInfo(TI).int.signedness == .signed) @as(TI, std.math.maxInt(TI)) else @as(TI, std.math.maxInt(TI)),
+            .valid => @intFromFloat(val),
+        };
     }
 
     // https://webassembly.github.io/spec/core/exec/numerics.html#xref-exec-numerics-op-fmin-mathrm-fmin-n-z-1-z-2
@@ -3182,11 +3239,6 @@ pub const Runtime = struct {
 
         const bytes = mem_inst.data[effective_addr .. effective_addr + N];
         std.mem.writeInt(T, bytes[0..N], val, .little);
-    }
-
-    fn truncSat(comptime Dst: type, comptime Src: type, val: Src) Dst {
-        if (std.math.isNan(val)) return 0;
-        return std.math.clamp(@as(Dst, @intFromFloat(val)), std.math.minInt(Dst), std.math.maxInt(Dst));
     }
 
     /// Unwind the value stack using pre-computed unwind info,
@@ -4060,16 +4112,16 @@ pub const Runtime = struct {
                     try self.push(.f64, floatCopySign(f64, args[0], args[1]));
                 },
                 .i32_trunc_f32_s => {
-                    try self.push(.i32, try truncFloat(i32, f32, self.pop(.f32)));
+                    try self.push(.i32, try floatTrunc(i32, f32, self.pop(.f32)));
                 },
                 .i32_trunc_f32_u => {
-                    try self.push(.i32, @bitCast(try truncFloat(u32, f32, self.pop(.f32))));
+                    try self.push(.i32, @bitCast(try floatTrunc(u32, f32, self.pop(.f32))));
                 },
                 .i32_trunc_f64_s => {
-                    try self.push(.i32, try truncFloat(i32, f64, self.pop(.f64)));
+                    try self.push(.i32, try floatTrunc(i32, f64, self.pop(.f64)));
                 },
                 .i32_trunc_f64_u => {
-                    try self.push(.i32, @bitCast(try truncFloat(u32, f64, self.pop(.f64))));
+                    try self.push(.i32, @bitCast(try floatTrunc(u32, f64, self.pop(.f64))));
                 },
                 .i64_extend_i32_s => {
                     try self.push(.i64, intExtend(i64, i32, self.pop(.i32)));
@@ -4078,16 +4130,16 @@ pub const Runtime = struct {
                     try self.push(.i64, intExtend(i64, u32, self.pop(.i32)));
                 },
                 .i64_trunc_f32_s => {
-                    try self.push(.i64, try truncFloat(i64, f32, self.pop(.f32)));
+                    try self.push(.i64, try floatTrunc(i64, f32, self.pop(.f32)));
                 },
                 .i64_trunc_f32_u => {
-                    try self.push(.i64, @bitCast(try truncFloat(u64, f32, self.pop(.f32))));
+                    try self.push(.i64, @bitCast(try floatTrunc(u64, f32, self.pop(.f32))));
                 },
                 .i64_trunc_f64_s => {
-                    try self.push(.i64, try truncFloat(i64, f64, self.pop(.f64)));
+                    try self.push(.i64, try floatTrunc(i64, f64, self.pop(.f64)));
                 },
                 .i64_trunc_f64_u => {
-                    try self.push(.i64, @bitCast(try truncFloat(u64, f64, self.pop(.f64))));
+                    try self.push(.i64, @bitCast(try floatTrunc(u64, f64, self.pop(.f64))));
                 },
                 .f32_convert_i32_s => {
                     const v = self.pop(.i32);
@@ -4161,28 +4213,28 @@ pub const Runtime = struct {
                     try self.push(.i64, intExtend(i64, i32, self.pop(.i64)));
                 },
                 .i32_trunc_sat_f32_s => {
-                    try self.push(.i32, truncSat(i32, f32, self.pop(.f32)));
+                    try self.push(.i32, floatTruncSat(i32, f32, self.pop(.f32)));
                 },
                 .i32_trunc_sat_f32_u => {
-                    try self.push(.i32, @bitCast(truncSat(u32, f32, self.pop(.f32))));
+                    try self.push(.i32, @bitCast(floatTruncSat(u32, f32, self.pop(.f32))));
                 },
                 .i32_trunc_sat_f64_s => {
-                    try self.push(.i32, truncSat(i32, f64, self.pop(.f64)));
+                    try self.push(.i32, floatTruncSat(i32, f64, self.pop(.f64)));
                 },
                 .i32_trunc_sat_f64_u => {
-                    try self.push(.i32, @bitCast(truncSat(u32, f64, self.pop(.f64))));
+                    try self.push(.i32, @bitCast(floatTruncSat(u32, f64, self.pop(.f64))));
                 },
                 .i64_trunc_sat_f32_s => {
-                    try self.push(.i64, truncSat(i64, f32, self.pop(.f32)));
+                    try self.push(.i64, floatTruncSat(i64, f32, self.pop(.f32)));
                 },
                 .i64_trunc_sat_f32_u => {
-                    try self.push(.i64, @bitCast(truncSat(u64, f32, self.pop(.f32))));
+                    try self.push(.i64, @bitCast(floatTruncSat(u64, f32, self.pop(.f32))));
                 },
                 .i64_trunc_sat_f64_s => {
-                    try self.push(.i64, truncSat(i64, f64, self.pop(.f64)));
+                    try self.push(.i64, floatTruncSat(i64, f64, self.pop(.f64)));
                 },
                 .i64_trunc_sat_f64_u => {
-                    try self.push(.i64, @bitCast(truncSat(u64, f64, self.pop(.f64))));
+                    try self.push(.i64, @bitCast(floatTruncSat(u64, f64, self.pop(.f64))));
                 },
                 .ref_null => |ref_type| {
                     switch (ref_type) {

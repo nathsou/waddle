@@ -47,7 +47,7 @@ pub const Const = struct {
     type: ConstType,
     value: ?[]const u8 = null,
 
-    fn isNanCanonical(self: *Const) bool {
+    fn isNanCanonical(self: *const Const) bool {
         if (self.value) |val| {
             return std.mem.eql(u8, val, "nan:canonical");
         }
@@ -55,7 +55,7 @@ pub const Const = struct {
         return false;
     }
 
-    fn isNanArithmetic(self: *Const) bool {
+    fn isNanArithmetic(self: *const Const) bool {
         if (self.value) |val| {
             return std.mem.eql(u8, val, "nan:arithmetic");
         }
@@ -63,7 +63,7 @@ pub const Const = struct {
         return false;
     }
 
-    fn toValue(self: *Const) !runtime.Value {
+    fn toValue(self: *const Const) !runtime.Value {
         const value = self.value orelse {
             return error.MissingConstValue;
         };
@@ -95,8 +95,8 @@ pub const Const = struct {
         };
     }
 
-    fn matches(self: *Const, val: runtime.Value) !bool {
-        if (std.mem.eql(u8, self.value.?, "nan:canonical")) {
+    fn matches(self: *const Const, val: runtime.Value) !bool {
+        if (self.isNanCanonical()) {
             return switch (self.type) {
                 .f32 => @as(u32, @bitCast(val.f32)) & 0x7FFFFFFF == 0x7FC00000,
                 .f64 => @as(u64, @bitCast(val.f64)) & 0x7FFFFFFFFFFFFFFF == 0x7FF8000000000000,
@@ -104,7 +104,7 @@ pub const Const = struct {
             };
         }
 
-        if (std.mem.eql(u8, self.value.?, "nan:arithmetic")) {
+        if (self.isNanArithmetic()) {
             return switch (self.type) {
                 .f32 => @as(u32, @bitCast(val.f32)) & 0x7FC00000 == 0x7FC00000,
                 .f64 => @as(u64, @bitCast(val.f64)) & 0x7FF8000000000000 == 0x7FF8000000000000,
@@ -112,14 +112,22 @@ pub const Const = struct {
             };
         }
 
-        const expected_val = try std.fmt.parseInt(u64, self.value.?, 10);
-        return expected_val == val.encode();
+        if (self.value) |value| {
+            const expected_val = try std.fmt.parseInt(u64, value, 10);
+            return expected_val == val.encode();
+        }
+
+        return switch (val.getType()) {
+            .i32 => self.type == .i32,
+            .i64 => self.type == .i64,
+            .f32 => self.type == .f32,
+            .f64 => self.type == .f64,
+            .externref => self.type == .externref,
+            .funcref => self.type == .funcref,
+        };
     }
 
-    pub fn format(
-        self: *Const,
-        writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
+    pub fn format(self: *const Const, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const ty = switch (self.type) {
             .i32 => "i32",
             .i64 => "i64",
@@ -205,7 +213,7 @@ pub const WastInterpreter = struct {
     }
 
     fn runAction(self: *WastInterpreter, cmd: *const Command) !void {
-        const action = cmd.action.?;
+        const action = cmd.action orelse return error.NullAction;
         switch (action.type) {
             .invoke => {
                 const args = try self.allocator.alloc(runtime.Value, action.args.len);
@@ -217,16 +225,20 @@ pub const WastInterpreter = struct {
                 if (self.current_module) |*mod| {
                     const results = try mod.runtime.invokeExportedFunc(self.allocator, action.field, args);
                     defer self.allocator.free(results);
-                    if (cmd.expected.?.len != results.len) {
-                        return error.ExpectedResultCountMismatch;
-                    }
-
-                    for (results, 0..) |val, i| {
-                        const expected = &cmd.expected.?[i];
-                        if (!(try expected.matches(val))) {
-                            std.debug.print("Expected {f}, got {any}\n", .{ expected, val });
-                            return error.ExpectedResultValueMismatch;
+                    if (cmd.expected) |expected| {
+                        if (expected.len != results.len) {
+                            return error.ExpectedResultCountMismatch;
                         }
+
+                        for (results, 0..) |val, i| {
+                            const expected_i = &expected[i];
+                            if (!(try expected_i.matches(val))) {
+                                std.debug.print("Expected {f}, got {any}\n", .{ expected_i, val });
+                                return error.ExpectedResultValueMismatch;
+                            }
+                        }
+                    } else {
+                        return error.MissingExpectedConstValue;
                     }
                 } else {
                     return error.NoModuleLoaded;
@@ -246,7 +258,10 @@ pub const WastInterpreter = struct {
                 store.* = runtime.Store.init(self.allocator, null);
                 const module_path = try std.fs.path.join(self.allocator, &.{ self.directory, filename });
                 defer self.allocator.free(module_path);
-                const module_inst = try runtime.Runtime.initFromFile(self.allocator, module_path, store, &.{});
+                const module_inst = runtime.Runtime.initFromFile(self.allocator, module_path, store, &.{}) catch |err| {
+                    std.debug.print("Error loading module from {s}: {any}\n", .{ module_path, err });
+                    return err;
+                };
 
                 if (self.current_module) |*mod| {
                     mod.deinit();
@@ -270,6 +285,10 @@ pub const WastInterpreter = struct {
                     break :blk switch (err) {
                         error.IntegerDivideByZero => "integer divide by zero",
                         error.IntegerOverflow => "integer overflow",
+                        error.InvalidIndirectCallIndex => "undefined element",
+                        error.IndirectCallTypeMismatch => "indirect call type mismatch",
+                        error.UninitializedTableElement => "uninitialized element",
+                        error.InvalidConversionToInteger => "invalid conversion to integer",
                         else => {
                             std.debug.print("Unhandled error: {any}\n", .{err});
                             return error.UnhandledTrapError;
@@ -277,8 +296,11 @@ pub const WastInterpreter = struct {
                     };
                 };
 
-                if (!std.mem.eql(u8, cmd.text.?, error_str)) {
-                    return error.ExpectedTrapMessageMismatch;
+                if (cmd.text) |expected_error_str| {
+                    if (!std.mem.eql(u8, expected_error_str, error_str)) {
+                        std.debug.print("Expected trap message '{s}', got '{s}'\n", .{ expected_error_str, error_str });
+                        return error.ExpectedTrapMessageMismatch;
+                    }
                 }
             },
             else => {},
