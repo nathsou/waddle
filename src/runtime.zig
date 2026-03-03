@@ -3152,8 +3152,8 @@ pub const Runtime = struct {
     fn floatTruncSat(comptime TI: type, comptime TF: type, val: TF) TI {
         if (std.math.isNan(val)) return 0;
         return switch (floatTruncBoundsCheck(TI, TF, val)) {
-            .underflow => if (@typeInfo(TI).int.signedness == .signed) @as(TI, std.math.minInt(TI)) else 0,
-            .overflow => if (@typeInfo(TI).int.signedness == .signed) @as(TI, std.math.maxInt(TI)) else @as(TI, std.math.maxInt(TI)),
+            .underflow => std.math.minInt(TI),
+            .overflow => std.math.maxInt(TI),
             .valid => @intFromFloat(val),
         };
     }
@@ -3194,15 +3194,7 @@ pub const Runtime = struct {
 
     // https://webassembly.github.io/spec/core/exec/numerics.html#xref-exec-numerics-op-fnearest-mathrm-fnearest-n-z
     fn floatNearest(comptime T: type, val: T) T {
-        if (val == 0.5) {
-            return 0.0;
-        }
-
-        if (val == -0.5) {
-            return -0.0;
-        }
-
-        return @round(val);
+        return @trunc(val);
     }
 
     fn intExtend(comptime Dst: type, comptime Src: type, val: anytype) Dst {
