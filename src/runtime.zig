@@ -10,11 +10,11 @@ const MemIndex = types.MemIndex;
 const ValType = types.ValType;
 
 const PC = usize;
-const FuncRef = ?FuncAddr;
-const ExternRef = ?*anyopaque;
+pub const FuncRef = ?FuncAddr;
+pub const ExternRef = ?*anyopaque;
 
 pub const Value = union(ValType) {
-    const NullRefSentinel = std.math.maxInt(u64);
+    pub const NullRefSentinel = std.math.maxInt(u64);
 
     i32: i32,
     i64: i64,
@@ -814,6 +814,7 @@ const BytecodeLowering = struct {
     current_func: ?*const WasmFunc,
     branch_instr_idx: usize,
     stack_height: usize, // running value stack depth relative to frame base, for fast/slow branch selection
+    is_unreachable: bool, // true after br/br_table/return/unreachable; code until next block boundary is dead
 
     pub fn init(allocator: Allocator, store: *const Store) !BytecodeLowering {
         if (comptime @sizeOf(FlatInstr) > 32) {
@@ -839,6 +840,7 @@ const BytecodeLowering = struct {
             .current_func = null,
             .branch_instr_idx = 0,
             .stack_height = 0,
+            .is_unreachable = false,
         };
     }
 
@@ -1257,6 +1259,7 @@ const BytecodeLowering = struct {
         // stack_height tracks the value stack depth relative to frame.base_ptr.
         // At function entry, params are already on the stack.
         self.stack_height = func.type.params.len;
+        self.is_unreachable = false;
 
         // Emit instructions to initialize local variables with default values
         // Note: parameters are already on the stack, pushed by caller
@@ -1279,9 +1282,31 @@ const BytecodeLowering = struct {
             self.stack_height += local_group.count;
         }
 
+        // The function body is an implicit block. Push a label so that br/br_if
+        // with a label index equal to the current nesting depth targets the function
+        // return
+        const func_body_label_idx = self.block_labels.items.len;
+        try self.block_labels.append(self.allocator, BlockLabel{
+            .kind = .block,
+            .start = self.flat.items.len,
+            .end = 0, // patched below
+            .branches_to_patch = .empty,
+            .stack_height = self.stack_height,
+            .arity = func.type.results.len,
+        });
+
         for (func.code.body) |instr| {
             try self.lowerInstr(instr);
         }
+
+        self.is_unreachable = false;
+
+        // Patch branches targeting the function body to jump to the return instruction.
+        var func_body_label = &self.block_labels.items[func_body_label_idx];
+        func_body_label.end = self.flat.items.len;
+        try self.patchBranches(func_body_label);
+        func_body_label.deinit(self.allocator);
+        self.block_labels.items.len -= 1;
 
         try self.emit(.{ .@"return" = func.type.results.len });
     }
@@ -1462,9 +1487,15 @@ const BytecodeLowering = struct {
     }
 
     fn lowerInstr(self: *BytecodeLowering, instr: types.Instr) !void {
+        // In unreachable code (after br/br_table/return/unreachable), skip the instruction.
+        // The WebAssembly spec treats the rest of the block as having a polymorphic stack.
+        if (self.is_unreachable) return;
         const delta = try self.instrStackDelta(instr);
         switch (instr) {
-            .@"unreachable" => try self.emit(.@"unreachable"),
+            .@"unreachable" => {
+                try self.emit(.@"unreachable");
+                self.is_unreachable = true;
+            },
             .nop => try self.emit(.nop),
             .block, .loop => |block| {
                 const label_kind: BlockLabelKind = switch (instr) {
@@ -1496,6 +1527,8 @@ const BytecodeLowering = struct {
                 for (block.instructions) |block_instr| {
                     try self.lowerInstr(block_instr);
                 }
+                // Reset: unreachable state inside the body doesn't escape the block instruction.
+                self.is_unreachable = false;
 
                 if (label_kind == .block) {
                     var label = &self.block_labels.items[label_idx];
@@ -1538,6 +1571,8 @@ const BytecodeLowering = struct {
                 for (if_.then_instructions) |then_instr| {
                     try self.lowerInstr(then_instr);
                 }
+                // Reset: unreachable state inside then-body doesn't bleed into else-body.
+                self.is_unreachable = false;
 
                 // Unconditionally jump to end of if after then block.
                 // Emit fast or slow variant based on whether the stack height matches.
@@ -1563,13 +1598,14 @@ const BytecodeLowering = struct {
                 for (if_.else_instructions) |else_instr| {
                     try self.lowerInstr(else_instr);
                 }
+                // Reset: unreachable state inside else-body doesn't escape the if instruction.
+                self.is_unreachable = false;
 
                 var exit_label = &self.block_labels.items[exit_label_idx];
                 exit_label.end = self.flat.items.len;
                 try self.patchBranches(exit_label);
                 exit_label.deinit(self.allocator);
                 self.block_labels.items.len -= 1; // Pop the label
-
                 self.stack_height = label_height + num_results;
             },
             .br, .br_if => |label_idx| {
@@ -1626,6 +1662,8 @@ const BytecodeLowering = struct {
                         }
                     },
                 }
+                // Unconditional br makes all subsequent code in this block unreachable.
+                if (instr == .br) self.is_unreachable = true;
             },
             .br_table => |arg| {
                 // Allocate label_indices.len + 1; the last entry is the default.
@@ -1665,6 +1703,7 @@ const BytecodeLowering = struct {
                 }
 
                 try self.emit(.{ .br_table = .{ .targets = targets } });
+                self.is_unreachable = true; // br_table is an unconditional branch
             },
             .call => |func_idx| {
                 const call_instr_idx = self.flat.items.len;
@@ -1696,6 +1735,7 @@ const BytecodeLowering = struct {
                 } else {
                     return error.ReturnInstructionOutsideOfFunction;
                 }
+                self.is_unreachable = true; // return makes subsequent code in this block unreachable
             },
             .drop => try self.emit(.drop),
             .select => try self.emit(.select),
@@ -2852,6 +2892,10 @@ pub const Runtime = struct {
     pub fn init(allocator: Allocator, store: *Store, module: *ModuleInstance) !Runtime {
         var lowering = try BytecodeLowering.init(allocator, store);
         defer lowering.deinit();
+        errdefer {
+            module.deinit(allocator);
+            allocator.destroy(module);
+        }
 
         return Runtime{
             .allocator = allocator,
@@ -2944,6 +2988,7 @@ pub const Runtime = struct {
 
         for (func_type.params, 0..) |param_type, i| {
             if (self.stack.types[args_start + i] != param_type) {
+                std.debug.print("Argument type mismatch at position {d}: expected {any}, got {any}\n", .{ i, param_type, self.stack.types[args_start + i] });
                 return error.InvalidArgumentType;
             }
         }

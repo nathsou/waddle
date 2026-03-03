@@ -63,11 +63,16 @@ pub const Const = struct {
         return false;
     }
 
-    fn toValue(self: *const Const) !runtime.Value {
-        const value = self.value orelse {
-            return error.MissingConstValue;
-        };
+    fn isNullRef(self: *const Const) bool {
+        if (self.value) |val| {
+            return (self.type == .funcref or self.type == .funcref) and std.mem.eql(u8, val, "null");
+        }
 
+        return false;
+    }
+
+    fn toValue(self: *const Const, buf: ?*usize) !runtime.Value {
+        const value = self.value orelse return error.MissingConstValue;
         return switch (self.type) {
             .i32 => .{ .i32 = @bitCast(try std.fmt.parseInt(u32, value, 10)) },
             .i64 => .{ .i64 = @bitCast(try std.fmt.parseInt(u64, value, 10)) },
@@ -89,8 +94,17 @@ pub const Const = struct {
                     return .{ .f64 = @bitCast(try std.fmt.parseInt(u64, value, 10)) };
                 }
             },
-            .externref, .funcref => {
-                return error.UnsupportedConstType;
+            .externref => {
+                buf.?.* = if (self.isNullRef()) runtime.Value.NullRefSentinel else try std.fmt.parseInt(usize, value, 10);
+                return .{ .externref = @ptrCast(buf) };
+            },
+            .funcref => {
+                if (self.isNullRef()) {
+                    return .{ .funcref = runtime.Value.NullRefSentinel };
+                } else {
+                    const intval = try std.fmt.parseInt(usize, value, 10);
+                    return .{ .funcref = intval };
+                }
             },
         };
     }
@@ -113,6 +127,14 @@ pub const Const = struct {
         }
 
         if (self.value) |value| {
+            if (self.type == .externref) {
+                const expected_idx = try std.fmt.parseInt(usize, value, 10);
+                if (val.externref) |ref_ptr| {
+                    const actual_idx: usize = @as(*const usize, @ptrCast(@alignCast(ref_ptr))).*;
+                    return expected_idx == actual_idx;
+                }
+                return false;
+            }
             const expected_val = try std.fmt.parseInt(u64, value, 10);
             return expected_val == val.encode();
         }
@@ -140,7 +162,8 @@ pub const Const = struct {
         try writer.print("{s}", .{ty});
 
         if (self.value) |raw_val| {
-            if (self.toValue()) |val| {
+            var buf: usize = undefined;
+            if (self.toValue(&buf)) |val| {
                 try writer.print("({f})", .{val});
             } else |_| {
                 try writer.print("({s})", .{raw_val});
@@ -218,8 +241,21 @@ pub const WastInterpreter = struct {
             .invoke => {
                 const args = try self.allocator.alloc(runtime.Value, action.args.len);
                 defer self.allocator.free(args);
+
+                var externref_count: usize = 0;
+                for (action.args) |*arg| {
+                    if (arg.type == .externref) {
+                        externref_count += 1;
+                    }
+                }
+
+                // buffer to hold externref values since they need to be passed as pointers
+                var externref_buf: [8]usize = undefined;
+                var externref_idx: usize = 0;
+
                 for (action.args, 0..) |*arg, i| {
-                    args[i] = try arg.toValue();
+                    args[i] = try arg.toValue(if (arg.type == .externref) &externref_buf[externref_idx] else null);
+                    if (arg.type == .externref) externref_idx += 1;
                 }
 
                 if (self.current_module) |*mod| {
@@ -260,6 +296,8 @@ pub const WastInterpreter = struct {
                 defer self.allocator.free(module_path);
                 const module_inst = runtime.Runtime.initFromFile(self.allocator, module_path, store, &.{}) catch |err| {
                     std.debug.print("Error loading module from {s}: {any}\n", .{ module_path, err });
+                    store.deinit();
+                    self.allocator.destroy(store);
                     return err;
                 };
 
