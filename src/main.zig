@@ -187,8 +187,8 @@ fn specTestPrintChar(vm: *Runtime) !void {
 
 fn runWasiModule(allocator: std.mem.Allocator, module_name: []const u8, host: *wasi_host.WasiSnapshotPreview1) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_dir = try std.fs.selfExeDirPath(&path_buf);
-    const tool_path = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "..", "res", "tools", module_name });
+    const cwd = try std.fs.cwd().realpath(".", &path_buf);
+    const tool_path = try std.fs.path.resolve(allocator, &.{ cwd, "res", "tools", module_name });
     defer allocator.free(tool_path);
     var store = runtime.Store.init(allocator, @ptrCast(host));
     defer store.deinit();
@@ -264,4 +264,44 @@ fn runSpecTest(allocator: std.mem.Allocator, spec_test_path: []const u8) !void {
     var interpreter = try wast.WastInterpreter.init(allocator, json_path);
     defer interpreter.deinit();
     try interpreter.run(parsed.value);
+}
+
+fn dirExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+test "spectests" {
+    // first ensure that the testsuite submodule exists
+    const allocator = std.heap.page_allocator;
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const spectests_path = try std.fs.path.resolve(allocator, &.{ cwd, "testsuite" });
+    defer allocator.free(spectests_path);
+    if (!dirExists(spectests_path)) {
+        std.debug.print("spectests submodule not found at path: {s}, fetch it by running `git submodule update --init --recursive`\n", .{spectests_path});
+        return error.SpectestsSubmoduleNotFound;
+    }
+
+    var spectests_dir = try std.fs.cwd().openDir("testsuite", .{});
+    defer spectests_dir.close();
+    const tests: []const []const u8 = &.{
+        "address", "align", "binary-leb128", "i32",   "i64",      "f32",  "f64",           "f32_cmp",  "f64_cmp", "f32_bitwise", "f32_bitwise", "conversions",
+        "block",   "if",    "br",            "br_if", "br_table", "call", "call_indirect", "comments", "const",   "custom",      "endianness",  "fac",
+        "func",
+        // "elem", "data", "bulk"
+    };
+
+    for (tests) |test_name| {
+        const with_extension = try std.mem.concat(allocator, u8, &.{ test_name, ".wast" });
+        defer allocator.free(with_extension);
+        const wast_path = try std.fs.path.resolve(allocator, &.{ spectests_path, with_extension });
+        defer allocator.free(wast_path);
+
+        if (runSpecTest(allocator, wast_path)) |_| {
+            std.debug.print("[PASS] {s}\n", .{wast_path});
+        } else |err| {
+            std.debug.print("[FAIL] {s}: {any}\n", .{ wast_path, err });
+        }
+    }
 }

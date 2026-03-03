@@ -15,6 +15,10 @@ WASM core 1.0 Virtual Machine in Zig
 - [ ] [Bulk Memory Operations](https://github.com/WebAssembly/spec/blob/main/proposals/bulk-memory-operations/Overview.md)
 - [x] [Reference Types](https://github.com/WebAssembly/spec/blob/main/proposals/reference-types/Overview.md)
 
+## Tests
+
+Run `zig build test -Doptimize=ReleaseSafe` to run a subset of the official WebAssembly tests.
+
 ## TODO
 - [ ] Module validation
 - [ ] Pass all official tests

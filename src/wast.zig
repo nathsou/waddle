@@ -242,13 +242,6 @@ pub const WastInterpreter = struct {
                 const args = try self.allocator.alloc(runtime.Value, action.args.len);
                 defer self.allocator.free(args);
 
-                var externref_count: usize = 0;
-                for (action.args) |*arg| {
-                    if (arg.type == .externref) {
-                        externref_count += 1;
-                    }
-                }
-
                 // buffer to hold externref values since they need to be passed as pointers
                 var externref_buf: [8]usize = undefined;
                 var externref_idx: usize = 0;
@@ -294,7 +287,7 @@ pub const WastInterpreter = struct {
                 store.* = runtime.Store.init(self.allocator, null);
                 const module_path = try std.fs.path.join(self.allocator, &.{ self.directory, filename });
                 defer self.allocator.free(module_path);
-                const module_inst = runtime.Runtime.initFromFile(self.allocator, module_path, store, &.{}) catch |err| {
+                const module_inst = runtime.Runtime.initFromFile(self.allocator, module_path, store, &SpecTestHost.getImports()) catch |err| {
                     std.debug.print("Error loading module from {s}: {any}\n", .{ module_path, err });
                     store.deinit();
                     self.allocator.destroy(store);
@@ -327,6 +320,7 @@ pub const WastInterpreter = struct {
                         error.IndirectCallTypeMismatch => "indirect call type mismatch",
                         error.UninitializedTableElement => "uninitialized element",
                         error.InvalidConversionToInteger => "invalid conversion to integer",
+                        error.MemoryLoadOutOfBounds, error.MemoryStoreOutOfBounds => "out of bounds memory access",
                         else => {
                             std.debug.print("Unhandled error: {any}\n", .{err});
                             return error.UnhandledTrapError;
@@ -343,5 +337,25 @@ pub const WastInterpreter = struct {
             },
             else => {},
         }
+    }
+};
+
+const SpecTestHost = struct {
+    fn printI32(vm_ptr: *anyopaque) !void {
+        const vm: *runtime.Runtime = @ptrCast(@alignCast(vm_ptr));
+        const val = try vm.stack.pop(.i32);
+        var buf: [64]u8 = undefined;
+        const formatted = try std.fmt.bufPrint(&buf, "{d}", .{val});
+        _ = try std.posix.write(std.posix.STDOUT_FILENO, formatted);
+    }
+
+    fn getImports() [1]runtime.Store.Import {
+        return .{
+            .{
+                .module = "spectest",
+                .name = "print_i32",
+                .value = .{ .func = printI32 },
+            },
+        };
     }
 };
