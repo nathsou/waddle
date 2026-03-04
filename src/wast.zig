@@ -179,6 +179,7 @@ pub const ActionType = enum {
 
 pub const Action = struct {
     type: ActionType,
+    module: ?[]const u8 = null,
     field: []const u8,
     args: []Const,
 };
@@ -189,9 +190,17 @@ pub const ModuleType = enum {
 };
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !std.json.Parsed(WastSpec) {
-    return try std.json.parseFromSlice(WastSpec, allocator, input, .{
+    var scanner = std.json.Scanner.initCompleteInput(allocator, input);
+    defer scanner.deinit();
+    var diag = std.json.Diagnostics{};
+    scanner.enableDiagnostics(&diag);
+
+    return std.json.parseFromTokenSource(WastSpec, allocator, &scanner, .{
         .ignore_unknown_fields = false,
-    });
+    }) catch |err| {
+        std.debug.print("Error parsing wast json at {d}:{d}\n", .{ diag.getLine(), diag.getColumn() });
+        return err;
+    };
 }
 
 pub const WastInterpreter = struct {

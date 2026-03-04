@@ -151,7 +151,7 @@ pub const FlatInstr = union(enum) {
     br_table: BranchTableArg,
     @"return": usize, // number of values to return
     call: struct { entry_pc: PC, arguments: usize },
-    call_indirect: struct { func_type: *const types.FuncType, table_addr: TableAddr },
+    call_indirect: struct { type_idx: u32, table_addr: TableAddr },
     call_host: FuncAddr,
 
     // Super instructions
@@ -1726,8 +1726,7 @@ const BytecodeLowering = struct {
                 const module_inst = try self.getCurrentModule();
                 const table_addr = module_inst.table_addrs[arg.table_idx];
                 std.debug.assert(module_inst.types.len > arg.type_idx);
-                const func_type = &module_inst.types[arg.type_idx];
-                try self.emit(.{ .call_indirect = .{ .func_type = func_type, .table_addr = table_addr } });
+                try self.emit(.{ .call_indirect = .{ .type_idx = arg.type_idx, .table_addr = table_addr } });
             },
             .@"return" => {
                 if (self.current_func) |f| {
@@ -2046,16 +2045,6 @@ pub const Store = struct {
             elem.deinit(self.allocator);
         }
 
-        for (self.funcs.items) |func| {
-            switch (func) {
-                .host => |hf| {
-                    self.allocator.free(hf.type.params);
-                    self.allocator.free(hf.type.results);
-                },
-                .wasm => {},
-            }
-        }
-
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.mems.deinit(self.allocator);
@@ -2111,23 +2100,9 @@ pub const Store = struct {
         const module_inst = try allocator.create(ModuleInstance);
         errdefer allocator.destroy(module_inst);
 
-        // Deep-copy the type section so the module's parsed memory can be freed
-        // after instantiation. FuncType params/results are referenced at runtime
-        // (call_indirect checks, invokeFunc, etc.) so they must outlive the module.
-        const types_copy = try allocator.alloc(types.FuncType, module.types.len);
-        errdefer {
-            for (types_copy) |*ft| ft.deinit(allocator);
-            allocator.free(types_copy);
-        }
-        for (module.types, 0..) |ft, i| {
-            const params = try allocator.dupe(types.ValType, ft.params);
-            errdefer allocator.free(params);
-            const results = try allocator.dupe(types.ValType, ft.results);
-            types_copy[i] = .{ .params = params, .results = results };
-        }
-
         module_inst.* = ModuleInstance{
-            .types = types_copy,
+            .valtypes_buf = module.valtypes_buf,
+            .types = module.types,
             .func_addrs = func_addrs,
             .table_addrs = table_addrs,
             .mem_addrs = mem_addrs,
@@ -2382,11 +2357,8 @@ pub const Store = struct {
     }
 
     fn registerHostFunc(self: *Store, ty: types.FuncType, func: HostFuncPtr) !FuncAddr {
-        const params = try self.allocator.dupe(types.ValType, ty.params);
-        errdefer self.allocator.free(params);
-        const results = try self.allocator.dupe(types.ValType, ty.results);
         const func_addr = self.funcs.items.len;
-        try self.funcs.append(self.allocator, .{ .host = .{ .type = .{ .params = params, .results = results }, .code = func } });
+        try self.funcs.append(self.allocator, .{ .host = .{ .type = ty, .code = func } });
         return func_addr;
     }
 
@@ -2456,7 +2428,7 @@ pub const Store = struct {
                     .func => |func_type_index| {
                         switch (import_val) {
                             .func => |host_func| {
-                                const func_type = module.types[@as(usize, func_type_index)];
+                                const func_type = module.types[func_type_index];
                                 const func_addr = try self.registerHostFunc(func_type, host_func);
                                 try extern_vals.append(self.allocator, .{ .func = func_addr });
                             },
@@ -2584,6 +2556,7 @@ pub const GlobalAddr = Addr;
 pub const ElemAddr = Addr;
 
 pub const ModuleInstance = struct {
+    valtypes_buf: []const ValType,
     types: []types.FuncType,
     func_addrs: []FuncAddr,
     table_addrs: []TableAddr,
@@ -2596,7 +2569,7 @@ pub const ModuleInstance = struct {
     start_addr: ?FuncAddr,
 
     pub fn deinit(self: *ModuleInstance, allocator: Allocator) void {
-        for (self.types) |*ft| ft.deinit(allocator);
+        allocator.free(self.valtypes_buf);
         allocator.free(self.types);
         allocator.free(self.func_addrs);
         allocator.free(self.table_addrs);
@@ -2919,9 +2892,9 @@ pub const Runtime = struct {
         var file_read_buffer: [4096]u8 = undefined;
         var reader = file.reader(&file_read_buffer);
         const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
-        var parser = parse.Parser.init(allocator, bytes);
+        var parser = try parse.Parser.init(allocator, bytes);
         var module = try parser.readModule();
-        defer module.deinit(allocator);
+        defer module.deinit(allocator, false); // do not free the valtypes buffer since it's reused by the module instance
         const module_inst = try store.instantiate(module, imports);
         return try Runtime.init(allocator, store, module_inst);
     }
@@ -2986,7 +2959,7 @@ pub const Runtime = struct {
 
         const args_start = self.stack.top - func_type.params.len;
 
-        for (func_type.params, 0..) |param_type, i| {
+        for (func_type.params.slice(self.module.valtypes_buf), 0..) |param_type, i| {
             if (self.stack.types[args_start + i] != param_type) {
                 std.debug.print("Argument type mismatch at position {d}: expected {any}, got {any}\n", .{ i, param_type, self.stack.types[args_start + i] });
                 return error.InvalidArgumentType;
@@ -3142,42 +3115,42 @@ pub const Runtime = struct {
     }
 
     fn floatTruncBoundsCheck(comptime TI: type, comptime TF: type, val: TF) enum { underflow, overflow, valid } {
-        if (TI == i32 and TF == f32) {
+        if (comptime TI == i32 and TF == f32) {
             if (val >= 2147483600.0) return .overflow;
             if (val < -2147483600.0) return .underflow;
         }
 
-        if (TI == u32 and TF == f32) {
+        if (comptime TI == u32 and TF == f32) {
             if (val >= 4294967300.0) return .overflow;
             if (val <= -1.0) return .underflow;
         }
 
-        if (TI == i32 and TF == f64) {
+        if (comptime TI == i32 and TF == f64) {
             if (val >= 2147483648.0) return .overflow;
             if (val <= -2147483649.0) return .underflow;
         }
 
-        if (TI == u32 and TF == f64) {
+        if (comptime TI == u32 and TF == f64) {
             if (val >= 4294967296.0) return .overflow;
             if (val <= -1.0) return .underflow;
         }
 
-        if (TI == i64 and TF == f32) {
+        if (comptime TI == i64 and TF == f32) {
             if (val >= 9223372000000000000.0) return .overflow;
             if (val < -9223372000000000000.0) return .underflow;
         }
 
-        if (TI == u64 and TF == f32) {
+        if (comptime TI == u64 and TF == f32) {
             if (val >= 18446744000000000000.0) return .overflow;
             if (val <= -1.0) return .underflow;
         }
 
-        if (TI == i64 and TF == f64) {
+        if (comptime TI == i64 and TF == f64) {
             if (val >= 9223372036854776000.0) return .overflow;
             if (val < -9223372036854776000.0) return .underflow;
         }
 
-        if (TI == u64 and TF == f64) {
+        if (comptime TI == u64 and TF == f64) {
             if (val >= 18446744073709552000.0) return .overflow;
             if (val <= -1.0) return .underflow;
         }
@@ -3383,7 +3356,7 @@ pub const Runtime = struct {
                             return error.InvalidHostFuncReturnCount;
                         }
 
-                        for (func_type.results, 0..) |result_type, i| {
+                        for (func_type.results.slice(self.module.valtypes_buf), 0..) |result_type, i| {
                             if (self.stack.types[stack_size_before + i] != result_type) {
                                 return error.InvalidHostFuncReturnType;
                             }
@@ -3398,16 +3371,18 @@ pub const Runtime = struct {
                         return error.InvalidIndirectCallIndex;
                     }
 
+                    const func_type = &self.module.types[call.type_idx];
+
                     if (Value.staticDecode(.funcref, table_inst.elem[i])) |func_addr| {
                         const func_inst = self.store.funcs.items[func_addr];
 
-                        if (!func_inst.getType().eql(call.func_type.*)) {
+                        if (!func_inst.getType().eql(func_type, self.module.valtypes_buf)) {
                             return error.IndirectCallTypeMismatch;
                         }
 
                         if (self.bytecode.functions[func_addr]) |entry_pc| {
                             try self.call_stack.push(Frame{
-                                .base_ptr = self.stack.top - call.func_type.params.len,
+                                .base_ptr = self.stack.top - func_type.params.len,
                                 .return_pc = pc,
                             });
 

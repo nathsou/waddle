@@ -67,17 +67,31 @@ pub const BlockType = union(enum) {
     type_index: TypeIndex,
 };
 
+// A slice indexing into an external buffer of type T
+// Allows slicing into buffers that may be reallocated (i.e. ArrayLists)
+pub fn IndexedSlice(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        offset: u16,
+        len: u16,
+
+        pub fn slice(self: *const Self, buf: []const T) []const T {
+            return buf[self.offset .. self.offset + self.len];
+        }
+
+        pub fn eql(self: *const Self, other: *const Self, buf: []const T) bool {
+            return self.len == other.len and std.mem.eql(T, self.slice(buf), other.slice(buf));
+        }
+    };
+}
+
 pub const FuncType = struct {
-    params: []const ValType,
-    results: []const ValType,
+    params: IndexedSlice(ValType),
+    results: IndexedSlice(ValType),
 
-    pub fn eql(self: FuncType, other: FuncType) bool {
-        return std.mem.eql(ValType, self.params, other.params) and std.mem.eql(ValType, self.results, other.results);
-    }
-
-    pub fn deinit(self: *FuncType, allocator: std.mem.Allocator) void {
-        allocator.free(self.params);
-        allocator.free(self.results);
+    pub fn eql(self: *const FuncType, other: *const FuncType, types_buf: []const ValType) bool {
+        return self.params.eql(&other.params, types_buf) and
+            self.results.eql(&other.results, types_buf);
     }
 };
 
@@ -423,6 +437,8 @@ pub const DataSection = []Data;
 pub const Module = struct {
     /// Raw WASM bytes. Names and other string-like fields are slices into this.
     bytes: []const u8,
+    // a buffer to store valtypes used in FuncTypes
+    valtypes_buf: []const ValType,
     custom: []CustomSection,
     types: TypeSection,
     imports: ImportSection,
@@ -436,13 +452,14 @@ pub const Module = struct {
     codes: CodeSection,
     data: DataSection,
 
-    pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Module, allocator: std.mem.Allocator, free_types: bool) void {
+        if (free_types) {
+            allocator.free(self.valtypes_buf);
+            allocator.free(self.types);
+        }
+
         allocator.free(self.bytes);
         allocator.free(self.custom);
-
-        for (self.types) |*ft| ft.deinit(allocator);
-        allocator.free(self.types);
-
         allocator.free(self.imports);
         allocator.free(self.functions);
         allocator.free(self.tables);
@@ -450,7 +467,6 @@ pub const Module = struct {
 
         for (self.globals) |global| freeExpr(allocator, global.init);
         allocator.free(self.globals);
-
         allocator.free(self.exports);
 
         for (self.elements) |elem| {

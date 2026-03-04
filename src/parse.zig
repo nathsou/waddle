@@ -7,14 +7,16 @@ const types = @import("types.zig");
 /// `wasm_bytes` slice. Call `module.deinit(allocator)` to free everything.
 pub const Parser = struct {
     bytes: []const u8,
+    valtypes_buf: std.ArrayList(types.ValType),
     index: usize = 0,
     allocator: std.mem.Allocator,
 
     /// Initialize a new Parser.
     /// The allocator should typically be an ArenaAllocator for simple cleanup.
-    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) Parser {
+    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) !Parser {
         return Parser{
             .bytes = bytes,
+            .valtypes_buf = try .initCapacity(allocator, 64),
             .allocator = allocator,
         };
     }
@@ -108,6 +110,21 @@ pub const Parser = struct {
         return vec;
     }
 
+    // reads a vector of ValTypes, but stores them in the parser's valtypes_buf to avoid extra allocations
+    fn readValTypeVector(self: *Parser) !types.IndexedSlice(types.ValType) {
+        const len = try self.readU32();
+        const offset = self.valtypes_buf.items.len;
+
+        for (0..len) |_| {
+            try self.valtypes_buf.append(self.allocator, try self.readValType());
+        }
+
+        return .{
+            .len = @intCast(len),
+            .offset = @intCast(offset),
+        };
+    }
+
     fn readName(self: *Parser) !types.Name {
         const name_len = try self.readU32();
 
@@ -171,8 +188,8 @@ pub const Parser = struct {
             return error.InvalidFuncType;
         }
 
-        const params = try self.readVector(types.ValType, readValType);
-        const results = try self.readVector(types.ValType, readValType);
+        const params = try self.readValTypeVector();
+        const results = try self.readValTypeVector();
 
         return .{ .params = params, .results = results };
     }
@@ -997,6 +1014,7 @@ pub const Parser = struct {
 
         return types.Module{
             .bytes = self.bytes,
+            .valtypes_buf = try self.valtypes_buf.toOwnedSlice(self.allocator),
             .custom = try custom_sections.toOwnedSlice(self.allocator),
             .types = types_,
             .imports = imports,

@@ -130,7 +130,7 @@ fn run(allocator: std.mem.Allocator) !void {
 
         const func_args = try allocator.alloc(Value, func_type.params.len);
         defer allocator.free(func_args);
-        for (func_type.params, 0..) |param_type, j| {
+        for (func_type.params.slice(vm.module.valtypes_buf), 0..) |param_type, j| {
             func_args[j] = try parseValue(func_arg_strings[j], param_type);
         }
 
@@ -283,8 +283,6 @@ test "spectests" {
         return error.SpectestsSubmoduleNotFound;
     }
 
-    var spectests_dir = try std.fs.cwd().openDir("testsuite", .{});
-    defer spectests_dir.close();
     const tests: []const []const u8 = &.{
         "address", "align", "binary-leb128", "i32",   "i64",      "f32",  "f64",           "f32_cmp",  "f64_cmp", "f32_bitwise", "f32_bitwise", "conversions",
         "block",   "if",    "br",            "br_if", "br_table", "call", "call_indirect", "comments", "const",   "custom",      "endianness",  "fac",
@@ -293,9 +291,9 @@ test "spectests" {
     };
 
     for (tests) |test_name| {
-        const with_extension = try std.mem.concat(allocator, u8, &.{ test_name, ".wast" });
-        defer allocator.free(with_extension);
-        const wast_path = try std.fs.path.resolve(allocator, &.{ spectests_path, with_extension });
+        var buf: [32]u8 = undefined;
+        const file_name = try std.fmt.bufPrint(&buf, "{s}.wast", .{test_name});
+        const wast_path = try std.fs.path.resolve(allocator, &.{ spectests_path, file_name });
         defer allocator.free(wast_path);
 
         if (runSpecTest(allocator, wast_path)) |_| {
