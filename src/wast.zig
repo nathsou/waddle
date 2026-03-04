@@ -349,6 +349,25 @@ pub const WastInterpreter = struct {
     }
 };
 
+// https://github.com/WebAssembly/spec/blob/c07e5c9a80fb2ee593648c5957ccd2f0ad6f40fc/interpreter/README.md#spectest-host-module
+// (module
+//   (global (export "global_i32") i32)      ;; value 666
+//   (global (export "global_i64") i64)      ;; value 666
+//   (global (export "global_f32") f32)      ;; value 666.6
+//   (global (export "global_f64") f64)      ;; value 666.6
+
+//   (table (export "table") 10 20 funcref)  ;; null-initialized
+
+//   (memory (export "memory") 1 2)          ;; zero-initialized
+
+//   (func (export "print"))
+//   (func (export "print_i32") (param i32))
+//   (func (export "print_i64") (param i64))
+//   (func (export "print_f32") (param f32))
+//   (func (export "print_f64") (param f64))
+//   (func (export "print_i32_f32") (param i32 f32))
+//   (func (export "print_f64_f64") (param f64 f64))
+// )
 const SpecTestHost = struct {
     fn printI32(vm_ptr: *anyopaque) !void {
         const vm: *runtime.Runtime = @ptrCast(@alignCast(vm_ptr));

@@ -439,6 +439,7 @@ pub const Module = struct {
     bytes: []const u8,
     // a buffer to store valtypes used in FuncTypes
     valtypes_buf: []const ValType,
+    owns_type_bufs: bool,
     custom: []CustomSection,
     types: TypeSection,
     imports: ImportSection,
@@ -452,8 +453,8 @@ pub const Module = struct {
     codes: CodeSection,
     data: DataSection,
 
-    pub fn deinit(self: *Module, allocator: std.mem.Allocator, free_types: bool) void {
-        if (free_types) {
+    pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
+        if (self.owns_type_bufs) {
             allocator.free(self.valtypes_buf);
             allocator.free(self.types);
         }

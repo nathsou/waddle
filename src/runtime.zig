@@ -2064,7 +2064,7 @@ pub const Store = struct {
     fn allocModule(
         self: *Store,
         allocator: Allocator,
-        module: types.Module,
+        module: *types.Module,
         extern_val_imports: []const ExternVal,
         global_init_vals: []const Value,
     ) !*ModuleInstance {
@@ -2096,7 +2096,6 @@ pub const Store = struct {
         errdefer allocator.free(elem_addrs);
         const exports = try allocator.alloc(ExportInstance, module.exports.len);
         errdefer allocator.free(exports);
-
         const module_inst = try allocator.create(ModuleInstance);
         errdefer allocator.destroy(module_inst);
 
@@ -2114,7 +2113,18 @@ pub const Store = struct {
             .start_addr = null,
         };
 
-        errdefer module_inst.deinit(self.allocator);
+        var exports_initialized: usize = 0;
+
+        errdefer {
+            for (module_inst.exports[0..exports_initialized]) |exp| {
+                allocator.free(exp.name);
+            }
+            module_inst.exports_by_name.deinit();
+            module.owns_type_bufs = true;
+        }
+
+        module.owns_type_bufs = false;
+
         const func_base = self.funcs.items.len;
         const table_base = self.tables.items.len;
         const mem_base = self.mems.items.len;
@@ -2205,6 +2215,8 @@ pub const Store = struct {
         var local_table_idx: usize = 0;
         for (module.tables) |table_type| {
             const elem = try self.allocator.alloc(u64, table_type.limits.min);
+            errdefer self.allocator.free(elem);
+
             @memset(elem, Value.NullRefSentinel);
             const table_inst = TableInstance{
                 .type = table_type.elem_type,
@@ -2222,8 +2234,11 @@ pub const Store = struct {
         // Allocate memories
         var local_mem_idx: usize = 0;
         for (module.memories) |mem_type| {
+            const mem_data = try self.allocator.alloc(types.Byte, mem_type.limits.min * page_size);
+            errdefer self.allocator.free(mem_data);
+
             const mem_inst = MemoryInstance{
-                .data = try self.allocator.alloc(types.Byte, mem_type.limits.min * page_size),
+                .data = mem_data,
                 .max = mem_type.limits.max,
             };
 
@@ -2251,9 +2266,8 @@ pub const Store = struct {
 
         // Allocate elements
         for (module.elements, 0..) |*elem, i| {
-            var elem_inst = ElemInstance{
-                .refs = try self.allocator.alloc(u64, elem.init.length()),
-            };
+            var elem_inst = try ElemInstance.init(self.allocator, elem.init.length());
+            errdefer elem_inst.deinit(self.allocator);
 
             switch (elem.init) {
                 .func_indices => |indices| {
@@ -2269,7 +2283,7 @@ pub const Store = struct {
                 },
                 .exprs => |exprs| {
                     for (exprs, 0..) |expr, j| {
-                        const val = try self.evalConstExpr(global_addrs, expr);
+                        const val = try self.evalConstExpr(global_addrs, module_inst.func_addrs, expr);
 
                         if (!val.getType().isRefType()) {
                             return error.InvalidElemInitExpr;
@@ -2287,9 +2301,6 @@ pub const Store = struct {
 
         // Build exports, copying names so they survive module.deinit().
         for (module.exports, 0..) |exp, i| {
-            const name = try allocator.dupe(u8, exp.name);
-            errdefer allocator.free(name);
-
             const value: ExternVal = switch (exp.desc) {
                 .func => |func_idx| blk: {
                     const func_idx_usize = @as(usize, func_idx);
@@ -2321,19 +2332,23 @@ pub const Store = struct {
                 },
             };
 
-            module_inst.exports[i] = ExportInstance{ .name = name, .value = value };
+            const name = try allocator.dupe(u8, exp.name);
+            errdefer allocator.free(name);
 
             if (module_inst.exports_by_name.contains(name)) {
                 return error.DuplicateExportName;
             }
 
             try module_inst.exports_by_name.put(name, value);
+
+            module_inst.exports[i] = ExportInstance{ .name = name, .value = value };
+            exports_initialized += 1;
         }
 
         return module_inst;
     }
 
-    fn evalConstExpr(self: *Store, global_addrs: []GlobalAddr, expr: types.Expr) !Value {
+    fn evalConstExpr(self: *Store, global_addrs: []GlobalAddr, func_addrs: []const FuncAddr, expr: types.Expr) !Value {
         if (expr.len != 1) {
             return error.InvalidConstExpr;
         }
@@ -2352,6 +2367,17 @@ pub const Store = struct {
                 const global_inst = self.globals.items[global_addr];
                 return global_inst.value;
             },
+            .ref_null => |ref_type| switch (ref_type) {
+                .funcref => return .{ .funcref = null },
+                .externref => return .{ .externref = null },
+            },
+            .ref_func => |func_idx| {
+                const func_idx_usize = @as(usize, func_idx);
+                if (func_idx_usize >= func_addrs.len) {
+                    return error.InvalidFuncIndex;
+                }
+                return .{ .funcref = func_addrs[func_idx_usize] };
+            },
             else => return error.InvalidConstExpr,
         }
     }
@@ -2362,7 +2388,7 @@ pub const Store = struct {
         return func_addr;
     }
 
-    const ImportVal = union(enum) {
+    pub const ImportVal = union(enum) {
         func: HostFuncPtr,
         global: GlobalAddr,
     };
@@ -2404,7 +2430,7 @@ pub const Store = struct {
         );
     }
 
-    pub fn instantiate(self: *Store, module: types.Module, imports: []const Import) !*ModuleInstance {
+    pub fn instantiate(self: *Store, module: *types.Module, imports: []const Import) !*ModuleInstance {
         const num_global_imports = blk: {
             var count: usize = 0;
             for (module.imports) |import| {
@@ -2467,19 +2493,24 @@ pub const Store = struct {
         defer self.allocator.free(global_init_vals);
 
         for (module.globals, 0..) |global, i| {
-            const val = try self.evalConstExpr(global_extern_vals, global.init);
+            const val = try self.evalConstExpr(global_extern_vals, &.{}, global.init);
             global_init_vals[i] = val;
         }
 
         const elems_base_idx = self.elems.items.len;
         const module_inst = try self.allocModule(self.allocator, module, extern_vals.items, global_init_vals);
 
+        errdefer {
+            module_inst.deinit(self.allocator);
+            self.allocator.destroy(module_inst);
+        }
+
         // Initalise element segments
         for (module.elements, 0..) |elem, i| {
             switch (elem.mode) {
                 .passive, .declarative => {},
                 .active => |mode| {
-                    const offset_val = try self.evalConstExpr(global_extern_vals, mode.offset);
+                    const offset_val = try self.evalConstExpr(global_extern_vals, module_inst.func_addrs, mode.offset);
                     const offset = switch (offset_val) {
                         .i32 => |n| blk: {
                             if (n < 0) {
@@ -2515,7 +2546,7 @@ pub const Store = struct {
             switch (data.mode) {
                 .passive => {},
                 .active => |active_mode| {
-                    const offset_val = try self.evalConstExpr(global_extern_vals, active_mode.offset);
+                    const offset_val = try self.evalConstExpr(global_extern_vals, module_inst.func_addrs, active_mode.offset);
                     const offset = switch (offset_val) {
                         .i32 => |n| blk: {
                             if (n < 0) {
@@ -2709,6 +2740,7 @@ const ElemInstance = struct {
 
     fn deinit(self: *ElemInstance, allocator: Allocator) void {
         allocator.free(self.refs);
+        self.refs = &.{};
     }
 };
 
@@ -2894,8 +2926,8 @@ pub const Runtime = struct {
         const bytes = try reader.interface.allocRemaining(allocator, .unlimited);
         var parser = try parse.Parser.init(allocator, bytes);
         var module = try parser.readModule();
-        defer module.deinit(allocator, false); // do not free the valtypes buffer since it's reused by the module instance
-        const module_inst = try store.instantiate(module, imports);
+        defer module.deinit(allocator);
+        const module_inst = try store.instantiate(&module, imports);
         return try Runtime.init(allocator, store, module_inst);
     }
 

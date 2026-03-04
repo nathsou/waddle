@@ -1014,6 +1014,7 @@ pub const Parser = struct {
 
         return types.Module{
             .bytes = self.bytes,
+            .owns_type_bufs = true,
             .valtypes_buf = try self.valtypes_buf.toOwnedSlice(self.allocator),
             .custom = try custom_sections.toOwnedSlice(self.allocator),
             .types = types_,
